@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sos-microtik-mcp"
+version = "0.2.0"
+description = "MCP server that lets Claude discover, audit and configure MikroTik routers over SSH"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2",
+    "paramiko>=3.0",
+    "cryptography>=41",
+    "qrcode[pil]>=7.4",
+]
+
+[project.scripts]
+sos-microtik-mcp = "mikrotik_mcp:main"
+
+[tool.setuptools]
+py-modules = ["mikrotik_mcp"]
