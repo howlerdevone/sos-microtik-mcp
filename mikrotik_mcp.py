@@ -11,6 +11,7 @@ Tools
   WireGuard  : wireguard_status, wireguard_create_interface, wireguard_add_peer,
                wireguard_update_peer, wireguard_remove_peer
   Changes    : apply_changes, confirm_changes, rollback_now
+  Panel      : ui://sos-microtik/panel.html (MCP Apps, Claude Desktop)
 
 Every write tool defaults to dry_run=True (returns the plan only). When applied,
 changes run with a "commit confirmed" safety net: local export + on-router
@@ -21,19 +22,21 @@ Install: see README.md (uv tool install git+https://github.com/howlerdevone/sos-
 """
 import base64
 import datetime
+import functools
 import ipaddress
 import pathlib
 import re
 import secrets
 import socket
 import struct
+import threading
 import time
 
 import paramiko
-try:  # MCP Python SDK 2.x
-    from mcp.server.mcpserver import MCPServer as FastMCP
-except ImportError:  # SDK 1.x
-    from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer as FastMCP
+from mcp.types import CallToolResult, TextContent
+
+from mikrotik_ui import PANEL_HTML
 
 INSTRUCTIONS = """
 You manage MikroTik RouterOS devices for an on-site IT technician.
@@ -49,7 +52,8 @@ WORKFLOW
    ipconfig /renew) to get an address in the new subnet, then reconnect(new_host=<new
    router IP>) and confirm_changes before the rollback timer runs out. Use
    rollback_minutes=10 for these changes, and make sure the LAN DHCP server/pool is
-   moved to the new subnet too, or the renew will not get a valid address.
+   moved to the new subnet too, or the renew will not get a valid address. In the
+   panel, the same warning appears in the plan notes before 'Aplicar cambios'.
 2. router_overview, then collect_info(site) BEFORE changing anything.
 3. Every write tool defaults to dry_run=True. Run it dry first, explain the plan in plain
    language, show the commands, and only call again with dry_run=False after the user
@@ -60,6 +64,15 @@ WORKFLOW
    changed, use reconnect(new_host=...) and then confirm.
 5. Never disable SSH or remove the technician's access path: this server depends on SSH.
 6. Never repeat secrets (Wi-Fi passwords, private keys, preshared keys) in chat.
+
+PANEL (Claude Desktop chat only)
+- In Claude Desktop, the write tools, audit_security, wireguard_status, confirm_changes
+  and rollback_now render an interactive panel in Spanish. A dry run shows an
+  'Aplicar cambios' button; an applied change shows a rollback countdown with
+  'Confirmar' / 'Revertir' buttons. The panel informs you (model context, prefixed
+  '[Panel]') when the technician applies, confirms or reverts there: do NOT repeat
+  that action. Keep replies short when the panel already shows the details.
+- Claude Code has no panel: the same flow works in text.
 
 ADDRESSES, SUBNETS AND KEYS: ALWAYS ASK THE USER
 - Never invent or assume IP addresses, subnets, masks, DHCP ranges, VPN ports or
@@ -89,6 +102,44 @@ ROUTEROS KNOW-HOW
 """
 
 mcp = FastMCP("mikrotik", instructions=INSTRUCTIONS)
+
+# ---------------- MCP Apps panel ----------------
+UI_URI = "ui://sos-microtik/panel.html"
+UI_META = {"ui": {"resourceUri": UI_URI}, "ui/resourceUri": UI_URI}
+_UI = threading.local()
+_SECRET_ARGS = {"password", "private_key", "preshared_key"}
+
+
+@mcp.resource(UI_URI, name="SOS MikroTik panel", mime_type="text/html;profile=mcp-app",
+              description="Panel interactivo (español) para planes, cambios, auditoría y WireGuard",
+              meta={"ui": {"prefersBorder": False}})
+def panel_resource() -> str:
+    return PANEL_HTML
+
+
+def _ui_set(payload: dict) -> None:
+    """Structured data for the panel (Claude Desktop); ignored by text-only clients."""
+    _UI.payload = payload
+
+
+def ui_tool(fn):
+    """Register a tool that also renders the panel. The text result is unchanged
+    for the model; structuredContent carries the data the panel draws."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        _UI.payload = None
+        is_error = False
+        try:
+            text = str(fn(*args, **kwargs))
+        except Exception as e:
+            text, is_error = f"Error: {e}", True
+        payload = dict(getattr(_UI, "payload", None) or {"view": "message"})
+        payload.update({"text": text, "tool": fn.__name__, "session": kwargs.get("name", "router"),
+                        "arguments": {k: v for k, v in kwargs.items() if k not in _SECRET_ARGS}})
+        return CallToolResult(content=[TextContent(type="text", text=text)],
+                              structuredContent=payload, isError=is_error)
+    return mcp.tool(structured_output=False, meta=UI_META)(wrapper)
+
 OUTPUT_ROOT = pathlib.Path.home() / "mikrotik-sites"
 SESSIONS: dict[str, dict] = {}  # credentials kept in memory only
 
@@ -329,11 +380,16 @@ def _apply(name, commands, description, rollback_minutes=5, hide=()) -> tuple[st
                 "confirm_changes is called. Verify first.")
     else:
         tail = "\n\nNo rollback armed."
+    _ui_set({"view": "applied", "ok": ok, "description": description, "log": log,
+             "rollback_minutes": rollback_minutes, "folder": str(folder),
+             "deadline": (time.time() + rollback_minutes * 60) if rollback_minutes > 0 else None})
     return "\n".join(log) + tail + f"\nLog: {folder}", ok
 
 
 def _plan(name, commands, description, dry_run, rollback_minutes, hide=(), notes="") -> str:
     if dry_run:
+        _ui_set({"view": "plan", "description": description, "notes": notes,
+                 "commands": [_redact(c, hide) for c in commands], "rollback_minutes": rollback_minutes})
         body = "\n".join(f"{i}. {_redact(c, hide)}" for i, c in enumerate(commands, 1))
         return (f"DRY RUN: nothing was changed.\n\nPlan: {description}\n"
                 + (f"\nNotes:\n{notes}\n" if notes else "")
@@ -778,7 +834,7 @@ def collect_info(site: str, name: str = "router") -> str:
 # Wi-Fi
 # =====================================================================
 
-@mcp.tool()
+@ui_tool
 def configure_wifi(ssid: str, name: str = "router", interfaces: list[str] | None = None,
                    password: str | None = None, generate_password: bool = False,
                    security: str = "wpa2-wpa3", country: str | None = None,
@@ -854,7 +910,7 @@ def configure_wifi(ssid: str, name: str = "router", interfaces: list[str] | None
                 c += f" configuration.country={q(country)}"
         cmds.append(c)
 
-    result = _plan(name, cmds, f"Set SSID '{ssid}' ({security}) on {', '.join(targets)}",
+    result = _plan(name, cmds, f"Configurar SSID '{ssid}' ({security}) en {', '.join(targets)}",
                    dry_run, rollback_minutes, hide=[pw] if pw != "<password>" else [],
                    notes="\n".join(notes))
     if not dry_run and generate_password and "ERROR" not in result:
@@ -869,7 +925,7 @@ def configure_wifi(ssid: str, name: str = "router", interfaces: list[str] | None
 # Bridge + Wi-Fi subnet
 # =====================================================================
 
-@mcp.tool()
+@ui_tool
 def setup_bridge_with_wifi_subnet(
         wifi_gateway: str, name: str = "router", mode: str = "vlan",
         bridge: str = "bridge", wan_interface: str | None = None,
@@ -1044,7 +1100,7 @@ def setup_bridge_with_wifi_subnet(
                  "Connect via a LAN port for this change.")
     if not facts["interface_lists"].get("WAN"):
         notes.append("No WAN interface list exists: run firewall_baseline afterwards so Wi-Fi gets NAT.")
-    return _plan(name, C, f"Bridge ({mode}) with Wi-Fi subnet {net}", dry_run,
+    return _plan(name, C, f"Bridge ({mode}) con subred Wi-Fi {net}", dry_run,
                  rollback_minutes, notes="\n".join(notes))
 
 
@@ -1052,11 +1108,14 @@ def setup_bridge_with_wifi_subnet(
 # Security audit, hardening, firewall
 # =====================================================================
 
-@mcp.tool()
+SEV_ES = {"CRITICAL": "CRÍTICO", "HIGH": "ALTO", "MEDIUM": "MEDIO", "LOW": "BAJO", "INFO": "INFO"}
+
+
+@ui_tool
 def audit_security(name: str = "router", site: str | None = None) -> str:
-    """Read-only security audit: version, users, exposed services, firewall, DNS
-    resolver, proxies, MAC access, SNMP, Wi-Fi encryption, IPv6 firewall, and
-    compromise indicators (schedulers/scripts, socks/proxy, static DNS).
+    """Read-only security audit (report in Spanish): version, users, exposed services,
+    firewall, DNS resolver, proxies, MAC access, SNMP, Wi-Fi encryption, IPv6 firewall,
+    and compromise indicators (schedulers/scripts, socks/proxy, static DNS).
     Optionally saves the report to ~/mikrotik-sites/<site>/."""
     F: list[tuple[str, str, str]] = []
 
@@ -1066,36 +1125,39 @@ def audit_security(name: str = "router", site: str | None = None) -> str:
     facts = _facts(name)
     ver = _version(name)
     wan = facts["interface_lists"].get("WAN", [])
+    v = facts["version"]
 
     if ver < (6, 43):
-        add("CRITICAL", f"RouterOS {facts['version']} is very old with known critical "
-                        "exploits (e.g. Winbox credential theft).", "Upgrade immediately, then change all passwords.")
+        add("CRITICAL", f"RouterOS {v} es muy antiguo y tiene vulnerabilidades críticas conocidas "
+                        "(p. ej. robo de credenciales vía Winbox).",
+            "Actualizar de inmediato y luego cambiar todas las contraseñas.")
     elif ver[0] == 6:
-        add("MEDIUM", f"RouterOS {facts['version']} (v6).", "Plan an upgrade to current v7 stable.")
+        add("MEDIUM", f"RouterOS {v} (v6).", "Planificar la actualización a v7 estable.")
     else:
-        add("INFO", f"RouterOS {facts['version']}.", "Check System > Packages > Check For Updates.")
+        add("INFO", f"RouterOS {v}.", "Revisar actualizaciones en System > Packages > Check For Updates.")
 
     users = _terse(name, "/user print terse")
     if any(u.get("name") == "admin" and not u["_disabled"] for u in users):
-        add("MEDIUM", "Default 'admin' username is active.", "Create a named admin user, then disable or remove 'admin'.")
+        add("MEDIUM", "El usuario por defecto 'admin' está activo.",
+            "Crear un administrador con nombre propio y desactivar o eliminar 'admin'.")
     full = [u.get("name") for u in users if u.get("group") == "full" and not u["_disabled"]]
-    add("INFO", f"Users with full rights: {', '.join(full) or 'none'}.", "Confirm every account is known.")
+    add("INFO", f"Usuarios con permisos completos: {', '.join(full) or 'ninguno'}.",
+        "Confirmar que todas las cuentas son conocidas.")
 
     for s in _terse(name, "/ip service print terse"):
         if s["_disabled"]:
             continue
         n, addr = s.get("name"), s.get("address", "")
         if n in ("telnet", "ftp"):
-            add("HIGH", f"{n} enabled (cleartext passwords).", f"/ip service disable {n}")
+            add("HIGH", f"{n} habilitado (contraseñas sin cifrar).", f"/ip service disable {n}")
         elif n in ("www", "api"):
-            add("MEDIUM", f"{n} enabled (unencrypted).", f"Disable {n} or use the -ssl variant.")
+            add("MEDIUM", f"{n} habilitado (sin cifrar).", f"Deshabilitar {n} o usar la variante -ssl.")
         if not addr:
-            add("LOW", f"Service {n} accepts any source address.",
-                f"/ip service set {n} address=<LAN/mgmt subnets>")
+            add("LOW", f"El servicio {n} acepta conexiones desde cualquier dirección.",
+                f"/ip service set {n} address=<subredes LAN/gestión>")
 
-    ssh = _try(name, "/ip ssh print")
-    if re.search(r"strong-crypto:\s*no", ssh):
-        add("LOW", "SSH strong-crypto disabled.", "/ip ssh set strong-crypto=yes")
+    if re.search(r"strong-crypto:\s*no", _try(name, "/ip ssh print")):
+        add("LOW", "SSH strong-crypto deshabilitado.", "/ip ssh set strong-crypto=yes")
 
     rules = [r for r in _terse(name, "/ip firewall filter print terse") if not r["_dynamic"]]
     active = [r for r in rules if not r["_disabled"]]
@@ -1105,62 +1167,64 @@ def audit_security(name: str = "router", site: str | None = None) -> str:
     has_input_drop = any(r.get("action") == "drop" and set(k for k in r if not k.startswith("_")) <= catchall_keys
                          for r in inp)
     if not inp:
-        add("CRITICAL", "No input firewall rules: router management may be reachable from the internet.",
-            "Run firewall_baseline.")
+        add("CRITICAL", "No hay reglas de firewall en input: la administración del router podría "
+                        "estar expuesta a Internet.", "Ejecutar firewall_baseline.")
     elif not has_input_drop:
-        add("HIGH", "Input chain has no final catch-all drop.", "Run firewall_baseline or add a final drop for non-LAN.")
+        add("HIGH", "La cadena input no tiene una regla final de descarte (drop).",
+            "Ejecutar firewall_baseline o agregar un drop final para lo que no venga de LAN.")
     if inp and not any("established" in r.get("connection-state", "") for r in inp):
-        add("LOW", "Input chain doesn't accept established/related first.", "Add it at the top for performance.")
+        add("LOW", "La cadena input no acepta primero established/related.",
+            "Agregar esa regla al inicio (mejora el rendimiento).")
     if wan and not any(r.get("action") == "drop" and (r.get("in-interface-list") == "WAN"
                                                       or r.get("in-interface") in wan) for r in fwd):
-        add("HIGH", "Forward chain doesn't drop new connections from WAN.", "Run firewall_baseline.")
+        add("HIGH", "La cadena forward no descarta conexiones nuevas desde WAN.", "Ejecutar firewall_baseline.")
     dis = [r for r in rules if r["_disabled"]]
     if dis:
-        add("INFO", f"{len(dis)} disabled firewall rule(s).", "Review and remove if unneeded.")
-    if wan and not any(r.get("action") in ("masquerade", "src-nat") for r in _terse(name, "/ip firewall nat print terse")):
-        add("INFO", "No masquerade/src-nat rule.", "LAN clients may have no internet; check NAT.")
+        add("INFO", f"{len(dis)} regla(s) de firewall deshabilitada(s).", "Revisar y eliminar si no se usan.")
+    if wan and not any(r.get("action") in ("masquerade", "src-nat")
+                       for r in _terse(name, "/ip firewall nat print terse")):
+        add("INFO", "No hay regla masquerade/src-nat.", "Los clientes LAN podrían no tener Internet; revisar NAT.")
 
-    dns = _try(name, "/ip dns print")
-    if re.search(r"allow-remote-requests:\s*yes", dns) and not has_input_drop:
-        add("HIGH", "DNS remote requests enabled without input firewall (open resolver).",
-            "Add input firewall drop for WAN, or disable allow-remote-requests.")
+    if re.search(r"allow-remote-requests:\s*yes", _try(name, "/ip dns print")) and not has_input_drop:
+        add("HIGH", "DNS acepta consultas remotas sin firewall en input (resolver abierto).",
+            "Agregar drop en input para WAN o deshabilitar allow-remote-requests.")
     static_dns = [d for d in _terse(name, "/ip dns static print terse") if not d["_dynamic"]]
     if static_dns:
-        add("INFO", f"{len(static_dns)} static DNS entr(ies): "
+        add("INFO", f"{len(static_dns)} entrada(s) DNS estática(s): "
                     + ", ".join(d.get("name", d.get("regexp", "?")) for d in static_dns[:10]),
-            "Confirm none redirect popular domains (compromise indicator).")
+            "Confirmar que ninguna redirige dominios populares (indicador de compromiso).")
 
     if re.search(r"enabled:\s*yes", _try(name, "/ip socks print")):
-        add("HIGH", "SOCKS proxy enabled (common in compromised routers).", "/ip socks set enabled=no; investigate.")
+        add("HIGH", "Proxy SOCKS habilitado (común en routers comprometidos).", "/ip socks set enabled=no e investigar.")
     if re.search(r"enabled:\s*yes", _try(name, "/ip proxy print")):
-        add("HIGH", "Web proxy enabled (common in compromised routers).", "/ip proxy set enabled=no unless intentional.")
+        add("HIGH", "Web proxy habilitado (común en routers comprometidos).", "/ip proxy set enabled=no si no es intencional.")
     if re.search(r"enabled:\s*yes", _try(name, "/ip upnp print")):
-        add("MEDIUM", "UPnP enabled (LAN devices can open ports).", "Disable unless required.")
+        add("MEDIUM", "UPnP habilitado (los dispositivos LAN pueden abrir puertos).", "Deshabilitar salvo que se necesite.")
     if re.search(r"enabled:\s*yes", _try(name, "/tool bandwidth-server print")):
-        add("LOW", "Bandwidth-test server enabled.", "/tool bandwidth-server set enabled=no")
+        add("LOW", "Servidor de bandwidth-test habilitado.", "/tool bandwidth-server set enabled=no")
     if re.search(r"enabled:\s*yes", _try(name, "/tool romon print")):
-        add("INFO", "RoMON enabled.", "Disable if not used.")
+        add("INFO", "RoMON habilitado.", "Deshabilitar si no se usa.")
     if re.search(r"allowed-interface-list:\s*all", _try(name, "/tool mac-server print")):
-        add("MEDIUM", "MAC-Telnet allowed on all interfaces.", "/tool mac-server set allowed-interface-list=LAN")
+        add("MEDIUM", "MAC-Telnet permitido en todas las interfaces.", "/tool mac-server set allowed-interface-list=LAN")
     if re.search(r"allowed-interface-list:\s*all", _try(name, "/tool mac-server mac-winbox print")):
-        add("MEDIUM", "MAC-Winbox allowed on all interfaces.", "/tool mac-server mac-winbox set allowed-interface-list=LAN")
+        add("MEDIUM", "MAC-Winbox permitido en todas las interfaces.",
+            "/tool mac-server mac-winbox set allowed-interface-list=LAN")
     if re.search(r"discover-interface-list:\s*all", _try(name, "/ip neighbor discovery-settings print")):
-        add("LOW", "Neighbor discovery on all interfaces (incl. WAN).",
+        add("LOW", "Descubrimiento de vecinos en todas las interfaces (incluida WAN).",
             "/ip neighbor discovery-settings set discover-interface-list=LAN")
     if re.search(r"enabled:\s*yes", _try(name, "/snmp print")):
         if any(c.get("name") == "public" for c in _terse(name, "/snmp community print terse")):
-            add("MEDIUM", "SNMP enabled with community 'public'.", "Change community or disable SNMP.")
+            add("MEDIUM", "SNMP habilitado con la comunidad 'public'.", "Cambiar la comunidad o deshabilitar SNMP.")
 
     for s in _terse(name, "/system scheduler print terse"):
         if s.get("name", "").startswith("mcp-"):
             continue
         ev = s.get("on-event", "")
         sev = "HIGH" if re.search(r"fetch|http|socks|proxy|import", ev, re.I) else "INFO"
-        add(sev, f"Scheduler '{s.get('name')}' runs: {ev[:120]}", "Confirm it is legitimate.")
+        add(sev, f"La tarea programada '{s.get('name')}' ejecuta: {ev[:120]}", "Confirmar que es legítima.")
     for s in _terse(name, "/system script print terse"):
-        src = s.get("source", "")
-        sev = "HIGH" if re.search(r"fetch|socks|proxy", src, re.I) else "INFO"
-        add(sev, f"Script '{s.get('name')}' present.", "Review its contents.")
+        sev = "HIGH" if re.search(r"fetch|socks|proxy", s.get("source", ""), re.I) else "INFO"
+        add(sev, f"Existe el script '{s.get('name')}'.", "Revisar su contenido.")
 
     if facts["wifi_driver"] == "wireless":
         profiles = {p.get("name"): p for p in _terse(name, "/interface wireless security-profiles print terse")}
@@ -1170,43 +1234,48 @@ def audit_security(name: str = "router", site: str | None = None) -> str:
             p = profiles.get(w.get("security-profile", "default"), {})
             mode, auth = p.get("mode", ""), p.get("authentication-types", "").split(",")
             if mode == "none":
-                add("HIGH", f"Wi-Fi {w.get('name')} ({w.get('ssid')}) is OPEN.", "Run configure_wifi.")
+                add("HIGH", f"La red Wi-Fi {w.get('name')} ({w.get('ssid')}) está ABIERTA.", "Ejecutar configure_wifi.")
             elif mode.startswith("static-keys"):
-                add("HIGH", f"Wi-Fi {w.get('name')} uses WEP.", "Run configure_wifi (WPA2).")
+                add("HIGH", f"La red Wi-Fi {w.get('name')} usa WEP.", "Ejecutar configure_wifi (WPA2).")
             elif "wpa-psk" in auth:
-                add("MEDIUM", f"Wi-Fi {w.get('name')} allows WPA1.", "Use WPA2 only.")
+                add("MEDIUM", f"La red Wi-Fi {w.get('name')} permite WPA1.", "Usar solo WPA2.")
             if w.get("wps-mode") not in (None, "", "disabled"):
-                add("LOW", f"WPS enabled on {w.get('name')}.", "Disable WPS.")
+                add("LOW", f"WPS habilitado en {w.get('name')}.", "Deshabilitar WPS.")
     elif facts["wifi_driver"] in ("wifi", "wifiwave2"):
-        menu = "/interface " + facts["wifi_driver"]
-        for w in _terse(name, f"{menu} print terse"):
+        for w in _terse(name, f"/interface {facts['wifi_driver']} print terse"):
             if w["_disabled"]:
                 continue
             auth = w.get("security.authentication-types", "")
-            if "wpa3" not in auth and auth:
-                add("INFO", f"Wi-Fi {w.get('name')} is WPA2-only; WPA3 is available.",
+            if auth and "wpa3" not in auth:
+                add("INFO", f"La red Wi-Fi {w.get('name')} usa solo WPA2; WPA3 está disponible.",
                     "configure_wifi security='wpa2-wpa3'.")
 
     v6addr = [a for a in _terse(name, "/ipv6 address print terse")
               if not a["_disabled"] and not a.get("address", "").lower().startswith("fe80")]
     if v6addr and not any(r.get("chain") == "input" for r in _terse(name, "/ipv6 firewall filter print terse")):
-        add("HIGH", "IPv6 is active but has no IPv6 input firewall.", "Add an IPv6 firewall (defconf-style).")
+        add("HIGH", "IPv6 está activo pero no hay firewall IPv6 en input.", "Agregar un firewall IPv6 (estilo defconf).")
 
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     F.sort(key=lambda x: order[x[0]])
     counts = {k: sum(1 for f in F if f[0] == k) for k in order}
-    report = (f"Security audit: {_session(name)['host']} | {facts['board']} | RouterOS {facts['version']}\n"
-              + " ".join(f"{k}:{v}" for k, v in counts.items()) + "\n\n"
-              + "\n".join(f"[{s}] {f}\n    Fix: {x}" for s, f, x in F)
-              + "\n\nNote: password strength cannot be checked remotely.")
+    host = _session(name)["host"]
+    report = (f"Auditoría de seguridad: {host} | {facts['board']} | RouterOS {v}\n"
+              + " ".join(f"{SEV_ES[k]}:{c}" for k, c in counts.items()) + "\n\n"
+              + "\n".join(f"[{SEV_ES[s]}] {f}\n    Corrección: {x}" for s, f, x in F)
+              + "\n\nNota: la fortaleza de las contraseñas no se puede verificar remotamente.")
+    saved = None
     if site:
         folder = _site_folder(site, "audit")
         (folder / "security_audit.txt").write_text(report, encoding="utf-8")
-        report += f"\nSaved to {folder}"
+        saved = str(folder)
+        report += f"\nGuardado en {folder}"
+    _ui_set({"view": "audit", "host": host, "board": facts["board"], "version": v,
+             "counts": counts, "saved": saved,
+             "findings": [{"sev": s, "finding": f, "fix": x} for s, f, x in F]})
     return report
 
 
-@mcp.tool()
+@ui_tool
 def harden_services(name: str = "router",
                     disable_services: list[str] | None = None,
                     restrict_mgmt_to: str | None = None,
@@ -1253,10 +1322,10 @@ def harden_services(name: str = "router",
     notes = "Make sure the LAN interface list contains your LAN bridge, or MAC-Winbox from LAN stops working."
     if restrict_mgmt_to:
         notes += f"\nSSH/Winbox will only accept {restrict_mgmt_to}; your laptop must be in that range."
-    return _plan(name, C, "Harden router services", dry_run, rollback_minutes, notes=notes)
+    return _plan(name, C, "Endurecer servicios del router", dry_run, rollback_minutes, notes=notes)
 
 
-@mcp.tool()
+@ui_tool
 def firewall_baseline(name: str = "router", wan_interface: str | None = None,
                       lan_interfaces: list[str] | None = None, replace_existing: bool = False,
                       add_nat: bool = True, dry_run: bool = True,
@@ -1325,7 +1394,7 @@ def firewall_baseline(name: str = "router", wan_interface: str | None = None,
              "Router management (SSH/Winbox) will only be reachable from LAN-list interfaces. "
              "Your laptop must be on a LAN interface.\n"
              "Existing mcp-wifi / mcp-wg rules stay at the top.")
-    return _plan(name, C, "IPv4 firewall baseline", dry_run, rollback_minutes, notes=notes)
+    return _plan(name, C, "Firewall base IPv4", dry_run, rollback_minutes, notes=notes)
 
 
 # =====================================================================
@@ -1360,42 +1429,54 @@ def _peer_nets(p: dict) -> list:
     return out
 
 
-@mcp.tool()
+@ui_tool
 def wireguard_status(name: str = "router") -> str:
     """Show WireGuard interfaces (address with mask in both formats), peers
     (handshake, traffic, endpoints) and whether the firewall allows each port.
     Secrets are masked."""
     _require_v7(name)
     wgs = _wg_interfaces(name)
+    host = _session(name)["host"]
     if not wgs:
+        _ui_set({"view": "wireguard", "host": host, "interfaces": []})
         return "No WireGuard interfaces configured."
     peers = _terse(name, "/interface wireguard peers print terse")
     rules = [r for r in _terse(name, "/ip firewall filter print terse") if not r["_disabled"]]
     lists = _facts(name)["interface_lists"]
-    out = []
+    data, out = [], []
     for n, w in wgs.items():
         port = w.get("listen-port", "?")
-        addrs = [f"{a} (mask {a.netmask})" for a in _wg_addrs(name, n)]
-        allowed = any(r.get("chain") == "input" and r.get("action") == "accept" and
-                      r.get("protocol") == "udp" and port in r.get("dst-port", "").split(",")
-                      for r in rules)
-        in_lists = [l for l, m in lists.items() if n in m]
-        out.append(f"Interface {n}{' (DISABLED)' if w['_disabled'] else ''}: port {port}, "
-                   f"address {', '.join(addrs) or 'NONE'}, public-key {w.get('public-key')}, "
-                   f"interface lists {in_lists or 'none'}, "
-                   f"firewall allows port: {'yes' if allowed else 'NO / not found'}")
+        addrs = _wg_addrs(name, n)
+        fw_ok = any(r.get("chain") == "input" and r.get("action") == "accept" and
+                    r.get("protocol") == "udp" and port in r.get("dst-port", "").split(",")
+                    for r in rules)
+        item = {"name": n, "disabled": w["_disabled"], "port": port,
+                "addresses": [{"cidr": str(a), "mask": str(a.netmask)} for a in addrs],
+                "public_key": w.get("public-key"), "firewall_ok": fw_ok,
+                "lists": [l for l, m in lists.items() if n in m], "peers": []}
         for p in [p for p in peers if p.get("interface") == n]:
-            ep = p.get("current-endpoint-address") or p.get("endpoint-address") or "-"
-            out.append(f"  peer '{p.get('comment', '')}'{' (DISABLED)' if p['_disabled'] else ''}: "
-                       f"key {p.get('public-key', '')[:12]}..., allowed {p.get('allowed-address')}, "
-                       f"endpoint {ep}, last handshake {p.get('last-handshake', 'never')}, "
-                       f"rx {p.get('rx', '?')} tx {p.get('tx', '?')}, "
-                       f"keepalive {p.get('persistent-keepalive', '-')}, "
-                       f"preshared key {'yes' if p.get('preshared-key') else 'no'}")
+            item["peers"].append({
+                "comment": p.get("comment", ""), "disabled": p["_disabled"],
+                "public_key": p.get("public-key", ""), "allowed_address": p.get("allowed-address", ""),
+                "endpoint": p.get("current-endpoint-address") or p.get("endpoint-address") or "",
+                "last_handshake": p.get("last-handshake", ""), "rx": p.get("rx", ""), "tx": p.get("tx", ""),
+                "keepalive": p.get("persistent-keepalive", ""), "psk": bool(p.get("preshared-key"))})
+        data.append(item)
+        out.append(f"Interface {n}{' (DISABLED)' if item['disabled'] else ''}: port {port}, address "
+                   f"{', '.join(a['cidr'] + ' (mask ' + a['mask'] + ')' for a in item['addresses']) or 'NONE'}, "
+                   f"public-key {item['public_key']}, interface lists {item['lists'] or 'none'}, "
+                   f"firewall allows port: {'yes' if fw_ok else 'NO / not found'}")
+        for p in item["peers"]:
+            out.append(f"  peer '{p['comment']}'{' (DISABLED)' if p['disabled'] else ''}: "
+                       f"key {p['public_key'][:12]}..., allowed {p['allowed_address']}, "
+                       f"endpoint {p['endpoint'] or '-'}, last handshake {p['last_handshake'] or 'never'}, "
+                       f"rx {p['rx'] or '?'} tx {p['tx'] or '?'}, keepalive {p['keepalive'] or '-'}, "
+                       f"preshared key {'yes' if p['psk'] else 'no'}")
+    _ui_set({"view": "wireguard", "host": host, "interfaces": data})
     return "\n".join(out)
 
 
-@mcp.tool()
+@ui_tool
 def wireguard_create_interface(address: str, private_key_source: str, wg_name: str,
                                listen_port: int, name: str = "router",
                                private_key: str | None = None,
@@ -1461,7 +1542,7 @@ def wireguard_create_interface(address: str, private_key_source: str, wg_name: s
              f"Remember port-forwarding UDP {listen_port} on any upstream modem/ISP router.\n"
              "With firewall_baseline, VPN peers reach the LAN but can't manage the router "
              "unless trust_as_lan=True.")
-    result = _plan(name, C, f"WireGuard interface {wg_name} {cidr} port {listen_port}",
+    result = _plan(name, C, f"Interfaz WireGuard {wg_name} {cidr}, puerto {listen_port}",
                    dry_run, rollback_minutes, hide=[pk] if pk else [], notes=notes)
     if not dry_run:
         rk = _wg_interfaces(name).get(wg_name, {}).get("public-key")
@@ -1472,7 +1553,7 @@ def wireguard_create_interface(address: str, private_key_source: str, wg_name: s
     return result
 
 
-@mcp.tool()
+@ui_tool
 def wireguard_add_peer(interface: str, allowed_address: str, name: str = "router",
                        public_key: str | None = None, use_preshared_key: bool = False,
                        preshared_key: str | None = None, comment: str = "",
@@ -1605,7 +1686,7 @@ def wireguard_add_peer(interface: str, allowed_address: str, name: str = "router
     if dry_run:
         cmd = build(public_key or "<entered in popup>",
                     "<entered in popup>" if use_preshared_key else None)
-        return _plan(name, [cmd], f"Add WireGuard peer '{label}' on {interface}", True,
+        return _plan(name, [cmd], f"Agregar peer WireGuard '{label}' en {interface}", True,
                      rollback_minutes, notes=notes)
 
     try:
@@ -1631,7 +1712,7 @@ def wireguard_add_peer(interface: str, allowed_address: str, name: str = "router
         return str(e)
 
     hide = [k for k in (psk, client_priv) if k]
-    text, ok = _apply(name, [build(pub, psk)], f"Add WireGuard peer '{label}' on {interface}",
+    text, ok = _apply(name, [build(pub, psk)], f"Agregar peer WireGuard '{label}' en {interface}",
                       rollback_minutes, hide=hide)
     if ok and write_client_config:
         tunnel = next((n for n in nets for a in wg_addrs if n.version == a.version and n.subnet_of(a.network)), nets[0])
@@ -1661,7 +1742,7 @@ def wireguard_add_peer(interface: str, allowed_address: str, name: str = "router
     return text + ("\nWarnings:\n- " + "\n- ".join(warnings) if warnings else "")
 
 
-@mcp.tool()
+@ui_tool
 def wireguard_update_peer(interface: str, peer: str, name: str = "router",
                           allowed_address: str | None = None, endpoint: str | None = None,
                           persistent_keepalive: int | None = None, disabled: bool | None = None,
@@ -1743,24 +1824,24 @@ def wireguard_update_peer(interface: str, peer: str, name: str = "router",
     if not sets:
         return "Nothing to change."
     C = [f"/interface wireguard peers set {_peer_find(interface, peer)} {' '.join(sets)}"]
-    return _plan(name, C, f"Update WireGuard peer '{peer[:20]}' on {interface}", dry_run,
+    return _plan(name, C, f"Modificar peer WireGuard '{peer[:20]}' en {interface}", dry_run,
                  rollback_minutes, hide=hide, notes="\n".join(notes))
 
 
-@mcp.tool()
+@ui_tool
 def wireguard_remove_peer(interface: str, peer: str, name: str = "router",
                           dry_run: bool = True, rollback_minutes: int = 5) -> str:
     """Remove a WireGuard peer, identified by its public key or comment."""
     _require_v7(name)
     C = [f"/interface wireguard peers remove {_peer_find(interface, peer)}"]
-    return _plan(name, C, f"Remove WireGuard peer '{peer[:20]}' from {interface}", dry_run, rollback_minutes)
+    return _plan(name, C, f"Eliminar peer WireGuard '{peer[:20]}' de {interface}", dry_run, rollback_minutes)
 
 
 # =====================================================================
 # generic changes + commit/rollback
 # =====================================================================
 
-@mcp.tool()
+@ui_tool
 def apply_changes(commands: list[str], description: str, name: str = "router",
                   rollback_minutes: int = 5, dry_run: bool = True) -> str:
     """Apply arbitrary RouterOS commands (one per list item) when no dedicated tool
@@ -1768,7 +1849,7 @@ def apply_changes(commands: list[str], description: str, name: str = "router",
     return _plan(name, commands, description, dry_run, rollback_minutes)
 
 
-@mcp.tool()
+@ui_tool
 def confirm_changes(name: str = "router") -> str:
     """Disarm the rollback after verifying the change works; saves the new config locally."""
     s = _session(name)
@@ -1777,12 +1858,13 @@ def confirm_changes(name: str = "router") -> str:
     folder = _site_folder("_changes", s["host"])
     (folder / "after_confirmed.rsc").write_text(_run(name, "/export show-sensitive terse", 90),
                                                 encoding="utf-8")
+    _ui_set({"view": "confirmed"})
     if ROLLBACK_SCHED in still:
         return "WARNING: rollback scheduler still present. Check /system scheduler."
     return f"Changes confirmed, rollback disarmed. Config saved to {folder}"
 
 
-@mcp.tool()
+@ui_tool
 def rollback_now(name: str = "router") -> str:
     """Immediately restore the pre-change backup. The router REBOOTS."""
     try:
@@ -1790,6 +1872,7 @@ def rollback_now(name: str = "router") -> str:
         _run(name, f'/system backup load name={BACKUP_NAME} password=""', timeout=15)
     except Exception:
         pass
+    _ui_set({"view": "rolledback"})
     return "Restore issued; router is rebooting. Reconnect in 1-2 minutes."
 
 

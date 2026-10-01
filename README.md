@@ -15,6 +15,7 @@ The server runs **locally on the technician's computer** and talks to routers on
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Connect it to Claude](#connect-it-to-claude)
+- [Interactive panel (Claude Desktop)](#interactive-panel-claude-desktop)
 - [Recommended: auto-approve read-only tools](#recommended-auto-approve-read-only-tools)
 - [Router preparation](#router-preparation)
 - [Addresses and keys: you always provide them](#addresses-and-keys-you-always-provide-them)
@@ -179,6 +180,40 @@ Use the full path, since desktop apps don't always see your terminal's PATH. The
 
 ---
 
+## Interactive panel (Claude Desktop)
+
+In the **Chat tab of Claude Desktop**, the server shows an interactive panel (in Spanish) right inside the conversation, using the [MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) extension. Claude Code (CLI and Code tab) doesn't render panels; everything works the same there as text.
+
+| Panel | Shown by | What you can do |
+|---|---|---|
+| **Plan de cambios** | Any change tool in dry-run mode (Wi-Fi, bridge, firewall, hardening, WireGuard, custom changes) | Review the validations and exact commands, then click **Aplicar cambios**, which asks for a second confirmation |
+| **Cambios aplicados** | After applying | See each command's result and a **rollback countdown**, then click **Todo funciona: confirmar** or **Revertir ahora** |
+| **Auditoría de seguridad** | `audit_security` | See findings by severity (filterable) with the fix for each, and re-run the audit |
+| **WireGuard** | `wireguard_status` | See interfaces, firewall status, and peers with a connection indicator (green / yellow / red), handshake and traffic, and refresh |
+
+When you apply, confirm or revert from the panel, the panel tells Claude, so it doesn't repeat the action. Note that **Aplicar cambios** runs the change directly from the panel (after its own second confirmation); it does not go through a separate approval in the chat, so read the plan before clicking. Secrets are never typed into the panel: router passwords, Wi-Fi passwords and WireGuard private and preshared keys still go through the local popup window on your computer.
+
+<p>
+  <img src="docs/panel-plan.png" width="49%" alt="Plan de cambios">
+  <img src="docs/panel-applied.png" width="49%" alt="Cambios aplicados con cuenta regresiva">
+</p>
+<p>
+  <img src="docs/panel-audit.png" width="49%" alt="Auditoría de seguridad">
+  <img src="docs/panel-wireguard.png" width="49%" alt="Estado de WireGuard">
+</p>
+
+To see the panel, register the server in the Chat side of Claude Desktop (`claude_desktop_config.json`, see [Claude Desktop (Chat tab)](#claude-desktop-chat-tab)) and fully restart the app.
+
+**For developers:** the panel source is `ui/panel.html`. It embeds the official MCP Apps client ([@modelcontextprotocol/ext-apps](https://github.com/modelcontextprotocol/ext-apps), Apache-2.0, vendored in `ui/vendor/`) so it also works offline at client sites. After editing the panel, regenerate the embedded copy:
+
+```bash
+python scripts/build_ui.py
+```
+
+This writes `mikrotik_ui.py`. Commit that file too, so that installing from GitHub doesn't need a build step.
+
+---
+
 ## Recommended: auto-approve read-only tools
 
 Claude Code asks permission before every tool call. You can let the read-only tools run freely while changes still require approval.
@@ -316,7 +351,7 @@ Add a WireGuard peer for Juan's phone. I'll give you the phone's public key and 
 **Tips**
 - Run `collect_info` at the start of every site visit so you always have a "before" copy.
 - When changing bridges, Wi-Fi or firewall rules, connect through a **LAN cable**, not Wi-Fi.
-- Right after `connect`, Claude tells you whether your PC is on the router's network and gets its IP from the router's DHCP. If you then change that network's IP/subnet, your PC loses the connection. After applying, release/renew its IP (Windows: `ipconfig /release`, then `ipconfig /renew`), have Claude `reconnect` to the router's new IP, and confirm before the rollback timer ends. The LAN DHCP server must also be moved to the new subnet, or the renew won't get a valid address.
+- Right after `connect`, Claude tells you whether your PC is on the router's network and gets its IP from the router's DHCP. If you then change that network's IP/subnet, your PC loses the connection. After applying, release/renew its IP (Windows: `ipconfig /release`, then `ipconfig /renew`), have Claude `reconnect` to the router's new IP, and confirm before the rollback timer ends. The LAN DHCP server must also be moved to the new subnet, or the renew won't get a valid address. In the panel, this warning appears in the plan notes before you click **Aplicar cambios**.
 - On many non-CRS3xx models (hAP, hEX, RB4011...), the single-bridge VLAN mode turns off hardware offloading, so switching goes through the CPU. Ask for `mode=separate_bridge` if LAN throughput matters.
 
 ---
@@ -370,6 +405,7 @@ Also remove the `mikrotik` entry from `claude_desktop_config.json` if you added 
 
 | Problem | Fix |
 |---|---|
+| Panel doesn't appear in Claude Desktop | The panel only shows in the Chat tab (not in Claude Code). Update Claude Desktop, check the server is in `claude_desktop_config.json`, and fully restart the app. The tools still work as text without the panel. |
 | `claude mcp list` shows **failed** | Run `sos-microtik-mcp` by hand in a terminal. If it waits silently, it works (press Ctrl+C). Otherwise it prints the real error. Use the full path when registering. |
 | Server not listed in Claude Desktop | Use the full path to the command in the config, then fully quit the app (including from the tray/menu bar) and reopen it. |
 | Password popup doesn't appear | It may be behind other windows. It opens on the computer running Claude, so it won't work if Claude Code runs over SSH on another machine. On Linux, install `python3-tk` and use Option B. |
@@ -386,4 +422,4 @@ Also remove the `mikrotik` entry from `claude_desktop_config.json` if you added 
 
 Provided as-is, without warranty. The automatic rollback reduces risk but doesn't remove it. Always keep an independent way back into the router (console cable, MAC-Winbox, or physical reset) and test on lab hardware first.
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE). The vendored MCP Apps client in `ui/vendor/` is Apache-2.0 (see `ui/vendor/LICENSE-ext-apps.txt`).

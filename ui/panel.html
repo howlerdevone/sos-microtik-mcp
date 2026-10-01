@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SOS MikroTik</title>
+<style>
+:root{
+  --bg: var(--color-background-primary, #ffffff);
+  --bg2: var(--color-background-secondary, #f5f5f4);
+  --bg3: var(--color-background-tertiary, #ecebe8);
+  --fg: var(--color-text-primary, #1f1e1c);
+  --fg2: var(--color-text-secondary, #5f5d58);
+  --fg3: var(--color-text-tertiary, #8a8780);
+  --line: var(--color-border-primary, #dddbd5);
+  --line2: var(--color-border-secondary, #e9e7e2);
+  --ok: var(--color-text-success, #1f7a3e);    --okbg: var(--color-background-success, #e7f4ec);
+  --warn: var(--color-text-warning, #946200);  --warnbg: var(--color-background-warning, #fbf1dc);
+  --bad: var(--color-text-danger, #b42318);    --badbg: var(--color-background-danger, #fdecea);
+  --info: var(--color-text-info, #1d5fa8);     --infobg: var(--color-background-info, #e8f0fb);
+  --r: var(--border-radius-md, 8px);
+  --rs: var(--border-radius-sm, 6px);
+  --sans: var(--font-sans, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+  --mono: var(--font-mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg: var(--color-background-primary, #262624); --bg2: var(--color-background-secondary, #1f1e1d);
+    --bg3: var(--color-background-tertiary, #30302e); --fg: var(--color-text-primary, #f2f1ee);
+    --fg2: var(--color-text-secondary, #b9b6ae); --fg3: var(--color-text-tertiary, #8d8a83);
+    --line: var(--color-border-primary, #3d3c39); --line2: var(--color-border-secondary, #33322f);
+    --okbg: var(--color-background-success, #17301f); --ok: var(--color-text-success, #6fd394);
+    --warnbg: var(--color-background-warning, #33290f); --warn: var(--color-text-warning, #f0c062);
+    --badbg: var(--color-background-danger, #3a1a17); --bad: var(--color-text-danger, #ff8a7f);
+    --infobg: var(--color-background-info, #172a40); --info: var(--color-text-info, #8fbcf2);
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:transparent;color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.45}
+#app{padding:2px}
+.card{background:var(--bg);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.hd{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line2)}
+.hd h2{margin:0;font-size:15px;font-weight:600;flex:1;min-width:0}
+.hd .sub{font-size:12px;color:var(--fg3);font-weight:400;display:block;margin-top:1px}
+.bd{padding:12px 14px}
+.ft{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;border-top:1px solid var(--line2);background:var(--bg2)}
+.ft .spacer{flex:1}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.b-ok{background:var(--okbg);color:var(--ok)} .b-warn{background:var(--warnbg);color:var(--warn)}
+.b-bad{background:var(--badbg);color:var(--bad)} .b-info{background:var(--infobg);color:var(--info)}
+.b-mute{background:var(--bg3);color:var(--fg2)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.d-ok{background:var(--ok)} .d-warn{background:var(--warn)} .d-bad{background:var(--bad)} .d-mute{background:var(--fg3)}
+button{font:inherit;font-size:13px;font-weight:500;border-radius:var(--rs);padding:6px 12px;cursor:pointer;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+button:hover:not(:disabled){background:var(--bg3)}
+button:disabled{opacity:.55;cursor:default}
+button.primary{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+button.primary:hover:not(:disabled){opacity:.88;background:var(--fg)}
+button.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+button.danger:hover:not(:disabled){opacity:.88;background:var(--bad)}
+button.ghost{border-color:transparent;background:transparent;color:var(--fg2)}
+.label{font-size:11.5px;font-weight:600;color:var(--fg3);text-transform:uppercase;letter-spacing:.04em;margin:14px 0 6px}
+.label:first-child{margin-top:0}
+pre,.mono{font-family:var(--mono);font-size:12px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg2);border:1px solid var(--line2);border-radius:var(--rs);padding:10px;max-height:320px;overflow:auto}
+ol.cmds{margin:0;padding:0;list-style:none;counter-reset:c;max-height:300px;overflow:auto;border:1px solid var(--line2);border-radius:var(--rs);background:var(--bg2)}
+ol.cmds li{counter-increment:c;display:flex;gap:10px;padding:6px 10px;border-bottom:1px solid var(--line2);font-family:var(--mono);font-size:12px;word-break:break-all}
+ol.cmds li:last-child{border-bottom:0}
+ol.cmds li::before{content:counter(c);color:var(--fg3);min-width:18px;text-align:right;flex:none}
+ol.cmds li.err{background:var(--badbg)} ol.cmds li.okl::before{color:var(--ok)}
+.note{font-size:12.5px;color:var(--fg2)}
+.status{padding:10px 12px;border-radius:var(--rs);font-size:13px;margin-bottom:12px}
+.s-ok{background:var(--okbg);color:var(--ok)} .s-warn{background:var(--warnbg);color:var(--warn)}
+.s-bad{background:var(--badbg);color:var(--bad)} .s-info{background:var(--infobg);color:var(--info)}
+.countdown{display:flex;align-items:center;gap:14px;padding:12px;border:1px solid var(--line);border-radius:var(--rs);background:var(--bg2)}
+.countdown .t{font-family:var(--mono);font-size:26px;font-weight:600;min-width:84px;font-variant-numeric:tabular-nums}
+.bar{height:6px;background:var(--bg3);border-radius:999px;overflow:hidden;margin-top:6px}
+.bar>i{display:block;height:100%;background:var(--warn);transition:width 1s linear}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer;background:var(--bg);color:var(--fg2);display:inline-flex;gap:6px;align-items:center}
+.chip.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.chip b{font-weight:700}
+.finding{border:1px solid var(--line2);border-left:4px solid var(--fg3);border-radius:var(--rs);padding:9px 11px;margin-top:8px;background:var(--bg)}
+.finding.CRITICAL{border-left-color:var(--bad)} .finding.HIGH{border-left-color:#e0652b}
+.finding.MEDIUM{border-left-color:var(--warn)} .finding.LOW{border-left-color:var(--info)}
+.finding .t{font-size:13px} .finding .fix{margin-top:4px;font-size:12px;color:var(--fg2)}
+.finding .fix code{font-family:var(--mono);background:var(--bg2);padding:1px 4px;border-radius:4px}
+.sev-CRITICAL{background:var(--badbg);color:var(--bad)} .sev-HIGH{background:#fde8dc;color:#b4501d}
+.sev-MEDIUM{background:var(--warnbg);color:var(--warn)} .sev-LOW{background:var(--infobg);color:var(--info)}
+.sev-INFO{background:var(--bg3);color:var(--fg2)}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .sev-HIGH{background:#3a2216;color:#ffa36e} }
+:root[data-theme="dark"] .sev-HIGH{background:#3a2216;color:#ffa36e}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:12.5px}
+.kv dt{color:var(--fg3)} .kv dd{margin:0;word-break:break-all}
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tblwrap{overflow-x:auto;border:1px solid var(--line2);border-radius:var(--rs);margin-top:8px}
+.tbl th{text-align:left;font-weight:600;color:var(--fg3);font-size:11.5px;padding:7px 9px;background:var(--bg2);border-bottom:1px solid var(--line2);white-space:nowrap}
+.tbl td{padding:7px 9px;border-bottom:1px solid var(--line2);vertical-align:top;white-space:nowrap}
+.tbl td.wrap{white-space:normal;min-width:110px}
+.tbl tr:last-child td{border-bottom:0}
+.wgif+.wgif{margin-top:14px;padding-top:14px;border-top:1px dashed var(--line)}
+.wgtitle{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.wgtitle strong{font-size:14px}
+details{margin-top:12px} summary{cursor:pointer;font-size:12.5px;color:var(--fg2)}
+details pre{margin-top:6px}
+.loading{padding:16px;color:var(--fg3);font-size:13px}
+.spin{width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--fg2);border-radius:50%;animation:s .8s linear infinite;display:inline-block;vertical-align:-2px;margin-right:6px}
+@keyframes s{to{transform:rotate(360deg)}}
+.empty{color:var(--fg3);font-size:12.5px;padding:6px 0}
+</style>
+</head>
+<body>
+<div id="app"><div class="loading"><span class="spin"></span>Cargando panel…</div></div>
+<script type="module">/*__EXT_APPS_BUNDLE__*/</script>
+<script type="module">
+const { App, applyDocumentTheme, applyHostStyleVariables, applyHostFonts } = window.__extapps;
+const app = new App({ name: "sos-microtik-panel", version: "0.3.0" });
+const root = document.getElementById("app");
+let timer = null;
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const SEV = { CRITICAL: "Crítico", HIGH: "Alto", MEDIUM: "Medio", LOW: "Bajo", INFO: "Info" };
+
+function applyCtx(ctx) {
+  if (!ctx) return;
+  try { if (ctx.theme) applyDocumentTheme(ctx.theme); } catch {}
+  try { if (ctx.styles?.variables) applyHostStyleVariables(ctx.styles.variables); } catch {}
+  try { if (ctx.styles?.css?.fonts) applyHostFonts(ctx.styles.css.fonts); } catch {}
+}
+async function tellModel(text) {
+  try { await app.updateModelContext({ content: [{ type: "text", text }] }); } catch {}
+}
+function textOf(res) {
+  return (res?.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+}
+function clearTimer() { if (timer) { clearInterval(timer); timer = null; } }
+
+async function call(name, args, busyMsg) {
+  clearTimer();
+  root.innerHTML = `<div class="card"><div class="loading"><span class="spin"></span>${esc(busyMsg)}</div></div>`;
+  try {
+    const res = await app.callServerTool({ name, arguments: args });
+    render(res);
+    return res;
+  } catch (e) {
+    render({ isError: true, content: [{ type: "text", text: String(e?.message || e) }] });
+  }
+}
+
+/* ---------- vistas ---------- */
+
+function viewMessage(sc, res) {
+  const isErr = res?.isError;
+  const text = sc?.text || textOf(res);
+  const looksInvalid = /Cannot continue|is not valid|is required|must be|not found|Refusing|overlap/i.test(text);
+  const cls = isErr ? "s-bad" : looksInvalid ? "s-warn" : "s-info";
+  const title = isErr ? "Error" : looksInvalid ? "Revisa los datos" : "Información";
+  root.innerHTML = `<div class="card">
+    <div class="hd"><h2>${title}</h2>${sc?.tool ? `<span class="badge b-mute">${esc(sc.tool)}</span>` : ""}</div>
+    <div class="bd">${looksInvalid && !isErr ? `<div class="status s-warn">No se hizo ningún cambio. Indica a Claude los valores corregidos.</div>` : ""}
+      <pre>${esc(text)}</pre></div></div>`;
+}
+
+function viewPlan(sc) {
+  const cmds = (sc.commands || []).map((c) => `<li>${esc(c)}</li>`).join("");
+  const rb = sc.rollback_minutes > 0
+    ? `Al aplicar se guarda un respaldo y se activa una <b>reversión automática en ${sc.rollback_minutes} min</b> si no confirmas.`
+    : `<b>Sin reversión automática</b> para este cambio.`;
+  root.innerHTML = `<div class="card">
+    <div class="hd"><h2>Plan de cambios<span class="sub">${esc(sc.description)}</span></h2>
+      <span class="badge b-info">Simulación · sin aplicar</span></div>
+    <div class="bd">
+      ${sc.notes ? `<div class="label">Detalles y validaciones</div><pre>${esc(sc.notes)}</pre>` : ""}
+      <div class="label">Comandos (${(sc.commands || []).length})</div><ol class="cmds">${cmds}</ol>
+      <p class="note" style="margin:10px 0 0">${rb} Si se piden claves, aparecerá una ventana en tu computadora.</p>
+    </div>
+    <div class="ft" id="ft">
+      <span class="note">Router: <b>${esc(sc.session)}</b></span><span class="spacer"></span>
+      <button class="primary" id="apply">Aplicar cambios</button>
+    </div></div>`;
+  document.getElementById("apply").onclick = () => {
+    const ft = document.getElementById("ft");
+    ft.innerHTML = `<span class="note"><b>¿Aplicar ${(sc.commands || []).length} comando(s) en el router?</b></span><span class="spacer"></span>
+      <button class="ghost" id="no">Cancelar</button><button class="danger" id="yes">Sí, aplicar</button>`;
+    document.getElementById("no").onclick = () => viewPlan(sc);
+    document.getElementById("yes").onclick = async () => {
+      const res = await call(sc.tool, { ...(sc.arguments || {}), dry_run: false }, "Aplicando cambios… (completa cualquier ventana de clave que aparezca)");
+      const s = res?.structuredContent || {};
+      await tellModel(`[Panel] El técnico aplicó desde el panel: "${sc.description}". Resultado: ${s.ok ? "OK" : "ERROR"}.` +
+        (s.deadline ? ` Reversión automática armada (${s.rollback_minutes} min). Esperar a que el técnico confirme o revierta; no volver a aplicar este cambio.` : ""));
+    };
+  };
+}
+
+function viewApplied(sc) {
+  const lines = (sc.log || []).map((l) => {
+    const err = /ERROR|CONNECTION LOST|Stopped/.test(l);
+    return `<li class="${err ? "err" : "okl"}">${esc(l.replace(/^\[\d+\]\s*(ok:\s*)?/, ""))}</li>`;
+  }).join("");
+  const head = sc.ok
+    ? `<div class="status s-ok">Cambios aplicados correctamente. Verifica que todo funcione (Internet, Wi-Fi, LAN, VPN).</div>`
+    : `<div class="status s-bad">Hubo un problema. El proceso se detuvo en el primer error.${sc.deadline ? " Puedes revertir ahora o esperar la reversión automática." : ""}</div>`;
+  root.innerHTML = `<div class="card">
+    <div class="hd"><h2>${sc.ok ? "Cambios aplicados" : "Error al aplicar"}<span class="sub">${esc(sc.description)}</span></h2>
+      <span class="badge ${sc.ok ? "b-ok" : "b-bad"}">${sc.ok ? "Aplicado" : "Error"}</span></div>
+    <div class="bd">${head}
+      <div id="cd"></div>
+      <div class="label">Resultado</div><ol class="cmds">${lines}</ol>
+      <details><summary>Detalles completos</summary><pre>${esc(sc.text)}</pre></details>
+    </div>
+    <div class="ft" id="ft"></div></div>`;
+  const ft = document.getElementById("ft");
+  if (sc.deadline) {
+    ft.innerHTML = `<span class="note">Router: <b>${esc(sc.session)}</b></span><span class="spacer"></span>
+      <button id="rb">Revertir ahora</button><button class="primary" id="ok">Todo funciona: confirmar</button>`;
+    document.getElementById("ok").onclick = async () => {
+      await call("confirm_changes", { name: sc.session }, "Confirmando cambios…");
+      await tellModel(`[Panel] El técnico CONFIRMÓ los cambios ("${sc.description}"). La reversión automática fue desactivada.`);
+    };
+    document.getElementById("rb").onclick = () => {
+      ft.innerHTML = `<span class="note"><b>¿Restaurar la configuración anterior? El router se reiniciará.</b></span><span class="spacer"></span>
+        <button class="ghost" id="no">Cancelar</button><button class="danger" id="yes">Sí, revertir</button>`;
+      document.getElementById("no").onclick = () => viewApplied(sc);
+      document.getElementById("yes").onclick = async () => {
+        await call("rollback_now", { name: sc.session }, "Restaurando respaldo…");
+        await tellModel(`[Panel] El técnico REVIRTIÓ los cambios ("${sc.description}"). El router se está reiniciando con la configuración anterior.`);
+      };
+    };
+    const total = sc.rollback_minutes * 60;
+    const cd = document.getElementById("cd");
+    const tick = () => {
+      const left = Math.max(0, Math.round(sc.deadline - Date.now() / 1000));
+      if (left <= 0) {
+        clearTimer();
+        cd.innerHTML = `<div class="status s-warn">Se agotó el tiempo: el router está restaurando la configuración anterior y reiniciando. Reconecta en 1–2 minutos.</div>`;
+        ft.innerHTML = `<span class="note">Reversión automática ejecutada.</span>`;
+        return;
+      }
+      const m = String(Math.floor(left / 60)).padStart(2, "0"), s = String(left % 60).padStart(2, "0");
+      cd.innerHTML = `<div class="countdown"><div class="t">${m}:${s}</div>
+        <div style="flex:1"><div><b>Reversión automática</b> si no confirmas</div>
+        <div class="bar"><i style="width:${(left / total) * 100}%"></i></div></div></div>`;
+    };
+    tick(); timer = setInterval(tick, 1000);
+  } else {
+    ft.innerHTML = `<span class="note">${sc.rollback_minutes > 0 ? "" : "No se armó reversión automática."}</span>`;
+  }
+}
+
+function viewConfirmed(sc, res) {
+  const ok = !res?.isError && !/WARNING/.test(sc.text || "");
+  root.innerHTML = `<div class="card"><div class="hd"><h2>${ok ? "Cambios confirmados" : "Atención"}</h2>
+    <span class="badge ${ok ? "b-ok" : "b-warn"}">${ok ? "Reversión desactivada" : "Revisar"}</span></div>
+    <div class="bd"><div class="status ${ok ? "s-ok" : "s-warn"}">${ok ? "La configuración nueva queda guardada. Se guardó una copia en tu computadora." : "No se pudo verificar que la reversión se desactivó. Revisa /system scheduler."}</div>
+    <pre>${esc(sc.text)}</pre></div></div>`;
+}
+
+function viewRolledBack(sc) {
+  root.innerHTML = `<div class="card"><div class="hd"><h2>Restauración en curso</h2><span class="badge b-warn">Reiniciando</span></div>
+    <div class="bd"><div class="status s-warn">El router está cargando el respaldo anterior y se reiniciará. Pide a Claude reconectar en 1–2 minutos.</div></div></div>`;
+}
+
+function viewAudit(sc) {
+  const order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"];
+  let filter = null;
+  const draw = () => {
+    const chips = order.map((k) => `<span class="chip ${filter === k ? "on" : ""}" data-k="${k}"><span class="badge sev-${k}" style="padding:0 6px">${sc.counts?.[k] ?? 0}</span>${SEV[k]}</span>`).join("");
+    const items = (sc.findings || []).filter((f) => !filter || f.sev === filter).map((f) => `
+      <div class="finding ${f.sev}"><div class="t"><span class="badge sev-${f.sev}">${SEV[f.sev]}</span> ${esc(f.finding)}</div>
+      <div class="fix">Corrección: ${f.fix.startsWith("/") ? `<code>${esc(f.fix)}</code>` : esc(f.fix)}</div></div>`).join("") || `<div class="empty">Sin hallazgos en esta categoría.</div>`;
+    const crit = (sc.counts?.CRITICAL || 0) + (sc.counts?.HIGH || 0);
+    root.innerHTML = `<div class="card">
+      <div class="hd"><h2>Auditoría de seguridad<span class="sub">${esc(sc.host)} · ${esc(sc.board)} · RouterOS ${esc(sc.version)}</span></h2>
+        <span class="badge ${crit ? "b-bad" : (sc.counts?.MEDIUM ? "b-warn" : "b-ok")}">${crit ? `${crit} urgente(s)` : (sc.counts?.MEDIUM ? "Mejorable" : "Bien")}</span></div>
+      <div class="bd"><div class="chips">${chips}</div>${items}
+        <p class="note" style="margin:12px 0 0">La fortaleza de las contraseñas no se puede verificar remotamente.${sc.saved ? ` Reporte guardado en <span class="mono">${esc(sc.saved)}</span>.` : ""}</p></div>
+      <div class="ft"><span class="note">Pide a Claude que corrija los hallazgos; cada cambio pasa por simulación y confirmación.</span><span class="spacer"></span>
+        <button id="again">Volver a auditar</button></div></div>`;
+    root.querySelectorAll(".chip").forEach((c) => c.onclick = () => { filter = filter === c.dataset.k ? null : c.dataset.k; draw(); });
+    document.getElementById("again").onclick = () => call("audit_security", { name: sc.session }, "Auditando el router…");
+  };
+  draw();
+}
+
+function hsSeconds(h) {
+  if (!h || /never/i.test(h)) return null;
+  if (/^\d+:\d+:\d+$/.test(h)) { const [a, b, c] = h.split(":").map(Number); return a * 3600 + b * 60 + c; }
+  const u = { w: 604800, d: 86400, h: 3600, m: 60, s: 1 }; let t = 0, found = false;
+  for (const [, n, k] of h.matchAll(/(\d+)([wdhms])/g)) { t += Number(n) * u[k]; found = true; }
+  return found ? t : null;
+}
+function peerState(p) {
+  if (p.disabled) return ["d-mute", "Deshabilitado"];
+  const s = hsSeconds(p.last_handshake);
+  if (s === null) return ["d-bad", "Nunca"];
+  if (s <= 180) return ["d-ok", "Conectado"];
+  if (s <= 3600) return ["d-warn", "Inactivo"];
+  return ["d-bad", "Sin conexión"];
+}
+function viewWireguard(sc) {
+  const ifs = (sc.interfaces || []).map((w) => {
+    const peers = (w.peers || []).map((p) => {
+      const [dot, label] = peerState(p);
+      return `<tr><td><span class="dot ${dot}"></span> ${label}</td><td class="wrap">${esc(p.comment || "—")}</td>
+        <td class="mono">${(p.allowed_address || "").split(",").map(esc).join("<br>")}</td><td class="mono">${esc(p.endpoint || "—")}</td>
+        <td>${esc(p.last_handshake || "nunca")}</td><td class="mono">${esc(p.rx || "?")} / ${esc(p.tx || "?")}</td>
+        <td>${p.psk ? "Sí" : "No"}</td></tr>`;
+    }).join("");
+    return `<div class="wgif"><div class="wgtitle"><strong>${esc(w.name)}</strong>
+        ${w.disabled ? `<span class="badge b-mute">Deshabilitada</span>` : `<span class="badge b-ok">Activa</span>`}
+        <span class="badge ${w.firewall_ok ? "b-ok" : "b-bad"}">${w.firewall_ok ? "Firewall permite el puerto" : "Firewall: puerto NO permitido"}</span></div>
+      <dl class="kv"><dt>Puerto UDP</dt><dd class="mono">${esc(w.port)}</dd>
+        <dt>Dirección</dt><dd class="mono">${(w.addresses || []).map((a) => `${esc(a.cidr)} (máscara ${esc(a.mask)})`).join("<br>") || "<span style='color:var(--bad)'>Sin dirección</span>"}</dd>
+        <dt>Clave pública</dt><dd class="mono">${esc(w.public_key)}</dd>
+        <dt>Listas</dt><dd>${esc((w.lists || []).join(", ") || "ninguna")}</dd></dl>
+      ${peers ? `<div class="tblwrap"><table class="tbl"><thead><tr><th>Estado</th><th>Peer</th><th>IPs permitidas</th><th>Endpoint</th><th>Último handshake</th><th>RX / TX</th><th>PSK</th></tr></thead><tbody>${peers}</tbody></table></div>` : `<div class="empty">Sin peers configurados.</div>`}
+    </div>`;
+  }).join("");
+  root.innerHTML = `<div class="card">
+    <div class="hd"><h2>WireGuard<span class="sub">${esc(sc.host || "")}</span></h2></div>
+    <div class="bd">${ifs || `<div class="empty">No hay interfaces WireGuard configuradas.</div>`}</div>
+    <div class="ft"><span class="note">Verde: handshake en los últimos 3 min · Amarillo: hasta 1 h · Rojo: más tiempo o nunca</span>
+      <span class="spacer"></span><button id="ref">Actualizar</button></div></div>`;
+  document.getElementById("ref").onclick = () => call("wireguard_status", { name: sc.session }, "Consultando WireGuard…");
+}
+
+function render(res) {
+  clearTimer();
+  const sc = res?.structuredContent;
+  if (!sc || res?.isError) return viewMessage(sc, res);
+  switch (sc.view) {
+    case "plan": return viewPlan(sc);
+    case "applied": return viewApplied(sc);
+    case "confirmed": return viewConfirmed(sc, res);
+    case "rolledback": return viewRolledBack(sc);
+    case "audit": return viewAudit(sc);
+    case "wireguard": return viewWireguard(sc);
+    default: return viewMessage(sc, res);
+  }
+}
+
+app.ontoolresult = (res) => render(res);
+app.onhostcontextchanged = (ctx) => applyCtx(ctx);
+await app.connect();
+applyCtx(app.getHostContext());
+</script>
+</body>
+</html>
