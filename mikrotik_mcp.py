@@ -41,6 +41,15 @@ You manage MikroTik RouterOS devices for an on-site IT technician.
 WORKFLOW
 1. discover_routers, then connect. Never ask the user to type the router password in
    chat: leave `password` empty so a local popup appears on their computer.
+   Right after connecting, read the "Technician PC" line that connect returns: it says
+   whether the technician's PC is on the same network as the router (and gets its IP
+   from the router's DHCP). Tell the user. If the customer asks to change that
+   network's IP/subnet, warn BEFORE applying: the PC will lose the connection, and
+   after applying it must release/renew its IP (Windows: ipconfig /release, then
+   ipconfig /renew) to get an address in the new subnet, then reconnect(new_host=<new
+   router IP>) and confirm_changes before the rollback timer runs out. Use
+   rollback_minutes=10 for these changes, and make sure the LAN DHCP server/pool is
+   moved to the new subnet too, or the renew will not get a valid address.
 2. router_overview, then collect_info(site) BEFORE changing anything.
 3. Every write tool defaults to dry_run=True. Run it dry first, explain the plan in plain
    language, show the commands, and only call again with dry_run=False after the user
@@ -633,7 +642,50 @@ def connect(host: str, username: str = "admin", name: str = "router",
         SESSIONS[name]["client"].close()
     SESSIONS[name] = {"client": client, "host": host, "user": username,
                       "port": port, "password": password}
-    return f"Connected to {host} as '{name}'.\n" + _run(name, "/system identity print")
+    return (f"Connected to {host} as '{name}'.\n" + _run(name, "/system identity print")
+            + "\n\n" + _local_link(name)["text"])
+
+
+RENEW_STEPS = ("Windows: ipconfig /release then ipconfig /renew | "
+               "macOS: sudo ipconfig set <en0> DHCP | "
+               "Linux: sudo dhclient -r <iface> && sudo dhclient <iface> "
+               "(or unplug/replug the cable)")
+
+
+def _local_link(name: str) -> dict:
+    """Where the technician's PC sits relative to the router: its IP, whether it is
+    inside one of the router's subnets, and whether it got that IP from the router's DHCP."""
+    info = {"local_ip": None, "interface": None, "network": None, "dhcp": False}
+    try:
+        ip = ipaddress.ip_address(_session(name)["client"].get_transport().sock.getsockname()[0])
+    except Exception:
+        info["text"] = "Technician PC: could not determine its IP address."
+        return info
+    info["local_ip"] = str(ip)
+    for a, iface in _router_networks(name):
+        if a.version == ip.version and ip in a.network:
+            info["interface"], info["network"] = iface, str(a.network)
+            break
+    if info["network"]:
+        info["dhcp"] = any(l.get("address") == str(ip)
+                           for l in _terse(name, "/ip dhcp-server lease print terse"))
+        how = "an IP leased by this router's DHCP" if info["dhcp"] else \
+            "a STATIC IP (no DHCP lease found on this router)"
+        text = (f"Technician PC: {ip} is ON the router's network {info['network']} "
+                f"(interface {info['interface']}) with {how}.\n"
+                "IMPORTANT: if the customer asks to change this network's IP/subnet, this PC "
+                "loses the connection when the change is applied. ")
+        text += (f"After applying, release/renew the PC's IP ({RENEW_STEPS}), then "
+                 "reconnect(new_host=<new router IP>) and confirm_changes before the rollback timer ends."
+                 if info["dhcp"] else
+                 "After applying, set a static IP on the PC inside the new subnet, then "
+                 "reconnect(new_host=<new router IP>) and confirm_changes before the rollback timer ends.")
+    else:
+        text = (f"Technician PC: {ip} is NOT in any of the router's subnets (reached through "
+                "routing). Changing the LAN IP should not cut this PC off, but verify the route.")
+    info["text"] = text
+    _session(name)["local_link"] = info
+    return info
 
 
 @mcp.tool()
@@ -978,6 +1030,14 @@ def setup_bridge_with_wifi_subnet(
     if mode == "vlan":
         notes.append("VLAN filtering is enabled LAST. On non-CRS3xx models this may disable "
                      "hardware offload (LAN switching via CPU).")
+    if lan_res:
+        link = _local_link(name)
+        if link["interface"] == bridge and link["network"] != str(lan_if.network):
+            notes.append(f"YOUR PC ({link['local_ip']}) IS ON THE LAN BEING CHANGED: it will lose the "
+                         f"connection. After applying, release/renew its IP ({RENEW_STEPS}), then "
+                         f"reconnect(new_host='{lan_if.ip}') and confirm_changes. Consider "
+                         "rollback_minutes=10. The LAN DHCP server/pool must also be moved to "
+                         f"{lan_if.network} (this tool does not change it), or the renew will fail.")
     if isolate_wifi_from_lan:
         notes.append("Wi-Fi and LAN cannot reach each other.")
     notes.append("If you are connected over Wi-Fi you will move to the new subnet. "

@@ -316,6 +316,7 @@ Add a WireGuard peer for Juan's phone. I'll give you the phone's public key and 
 **Tips**
 - Run `collect_info` at the start of every site visit so you always have a "before" copy.
 - When changing bridges, Wi-Fi or firewall rules, connect through a **LAN cable**, not Wi-Fi.
+- Right after `connect`, Claude tells you whether your PC is on the router's network and gets its IP from the router's DHCP. If you then change that network's IP/subnet, your PC loses the connection. After applying, release/renew its IP (Windows: `ipconfig /release`, then `ipconfig /renew`), have Claude `reconnect` to the router's new IP, and confirm before the rollback timer ends. The LAN DHCP server must also be moved to the new subnet, or the renew won't get a valid address.
 - On many non-CRS3xx models (hAP, hEX, RB4011...), the single-bridge VLAN mode turns off hardware offloading, so switching goes through the CPU. Ask for `mode=separate_bridge` if LAN throughput matters.
 
 ---
