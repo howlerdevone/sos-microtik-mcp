@@ -43,8 +43,8 @@ INSTRUCTIONS = """
 You manage MikroTik RouterOS devices for an on-site IT technician.
 
 WORKFLOW
-1. discover_routers, then connect (the router must be this PC's default gateway: omit
-   `host` and it is detected; other hosts are refused). Never ask the user to type the router password in
+1. discover_routers, then connect (omit `host` to use this PC's default gateway, or pass
+   the IP of any reachable MikroTik). Never ask the user to type the router password in
    chat: leave `password` empty so a local popup appears on their computer.
    Right after connecting, read the "Technician PC" line that connect returns: it says
    whether the technician's PC is on the same network as the router (and gets its IP
@@ -755,26 +755,62 @@ def _default_gateway() -> str | None:
         return None
 
 
+RENEW_STEPS = ("Windows: ipconfig /release then ipconfig /renew | "
+               "macOS: sudo ipconfig set <en0> DHCP | "
+               "Linux: sudo dhclient -r <iface> && sudo dhclient <iface> "
+               "(or unplug/replug the cable)")
+
+
+def _local_link(name: str) -> dict:
+    """Where the technician's PC sits relative to the router: its IP, whether it is
+    inside one of the router's subnets, and whether it got that IP from the router's DHCP."""
+    info = {"local_ip": None, "interface": None, "network": None, "dhcp": False}
+    try:
+        ip = ipaddress.ip_address(_session(name)["client"].get_transport().sock.getsockname()[0])
+    except Exception:
+        info["text"] = "Technician PC: could not determine its IP address."
+        return info
+    info["local_ip"] = str(ip)
+    for a, iface in _router_networks(name):
+        if a.version == ip.version and ip in a.network:
+            info["interface"], info["network"] = iface, str(a.network)
+            break
+    if info["network"]:
+        info["dhcp"] = any(l.get("address") == str(ip)
+                           for l in _terse(name, "/ip dhcp-server lease print terse"))
+        how = "an IP leased by this router's DHCP" if info["dhcp"] else \
+            "a STATIC IP (no DHCP lease found on this router)"
+        text = (f"Technician PC: {ip} is ON the router's network {info['network']} "
+                f"(interface {info['interface']}) with {how}.\n"
+                "IMPORTANT: if the customer asks to change this network's IP/subnet, this PC "
+                "loses the connection when the change is applied. ")
+        text += (f"After applying, release/renew the PC's IP ({RENEW_STEPS}), then "
+                 "reconnect(new_host=<new router IP>) and confirm_changes before the rollback timer ends."
+                 if info["dhcp"] else
+                 "After applying, set a static IP on the PC inside the new subnet, then "
+                 "reconnect(new_host=<new router IP>) and confirm_changes before the rollback timer ends.")
+    else:
+        text = (f"Technician PC: {ip} is NOT in any of the router's subnets (reached through "
+                "routing). Changing the LAN IP should not cut this PC off, but verify the route.")
+    info["text"] = text
+    _session(name)["local_link"] = info
+    return info
+
+
 @mcp.tool()
 def connect(host: str | None = None, username: str = "admin", name: str = "router",
             port: int = 22, password: str | None = None,
             save_password: bool = False) -> str:
-    """Open an SSH session to the router under `name`. The router MUST be the default
-    gateway of this PC's current network configuration: leave `host` empty and it is
-    detected automatically; any other host is refused. Leave `password` empty so the
+    """Open an SSH session to the router under `name`. `host` can be any reachable
+    MikroTik (any IP/hostname); if empty, this PC's default gateway is used. Leave `password` empty so the
     user is prompted in a local popup (keeps it out of the conversation). A password
     saved earlier in the OS credential store is used automatically; set
     save_password=True (after the user agrees) to store the one typed in the popup.
     The default gateway is NOT always 192.168.88.1: never assume it, call
     discover_routers (lists devices, flags the gateway) or just omit `host`."""
-    gw = _default_gateway()
-    if gw is None:
-        return "Could not determine this PC's default gateway. Check the network connection."
-    if host and host.strip() != gw:
-        return (f"Refused: {host} is not this PC's default gateway ({gw}). The router must be "
-                "the default gateway of the current network. Connect to the right network "
-                "or omit `host`.")
-    host = gw
+    host = (host or "").strip() or _default_gateway()
+    if not host:
+        return "Could not determine this PC's default gateway. Pass `host` explicitly."
     key = _cred_key(host, username)
     from_store = False
     if password is None:
