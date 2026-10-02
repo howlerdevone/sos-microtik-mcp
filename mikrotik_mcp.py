@@ -10,6 +10,7 @@ Tools
   Validate   : validate_network
   WireGuard  : wireguard_status, wireguard_create_interface, wireguard_add_peer,
                wireguard_update_peer, wireguard_remove_peer
+  Tunnels    : tunnel_setup, tunnel_verify (WireGuard + iBGP/OSPF/static, hub & spokes)
   Changes    : apply_changes, confirm_changes, rollback_now
   Panel      : ui://sos-microtik/panel.html (MCP Apps, Claude Desktop)
 
@@ -42,7 +43,8 @@ INSTRUCTIONS = """
 You manage MikroTik RouterOS devices for an on-site IT technician.
 
 WORKFLOW
-1. discover_routers, then connect. Never ask the user to type the router password in
+1. discover_routers, then connect (the router must be this PC's default gateway: omit
+   `host` and it is detected; other hosts are refused). Never ask the user to type the router password in
    chat: leave `password` empty so a local popup appears on their computer.
    Right after connecting, read the "Technician PC" line that connect returns: it says
    whether the technician's PC is on the same network as the router (and gets its IP
@@ -83,6 +85,15 @@ ADDRESSES, SUBNETS AND KEYS: ALWAYS ASK THE USER
 - This server never generates WireGuard keys. Ask the user for the remote peer's
   public key (in chat or the popup). Private and preshared keys are entered only in
   the local popup: leave those parameters empty and never ask for them in chat.
+
+SITE-TO-SITE TUNNELS (docs/runbook-tunnels.md)
+- Use tunnel_setup (one link at a time, one site at a time) and tunnel_verify. Hub = public IP;
+  spokes initiate. iBGP with filters is the recommended routing; spokes must never reach
+  each other (BGP filters + hub forward drop + allowed-address with only the hub's nets).
+- If the other router is not reachable, leave remote_name empty: the tool returns and saves
+  a CLI script for it. Later call tunnel_setup again with remote_public_key.
+- Never confirm_changes until tunnel_verify passes (handshake, ping both ways, routing up,
+  login to every router through the tunnel). Confirm on EVERY session touched.
 
 ROUTEROS KNOW-HOW
 - Check the version first. v6 and v7 differ in syntax; WireGuard exists only in v7.
@@ -199,6 +210,32 @@ def _popup_info(title: str, message: str) -> None:
         root.destroy()
     except Exception:
         pass
+
+
+KEYRING_SERVICE = "sos-microtik-mcp"
+
+
+def _cred_key(host: str, user: str) -> str:
+    """Saved-password key: the gateway's MAC (so two customers that both use the same
+    IP never share a password), falling back to the IP if the MAC is unknown."""
+    import subprocess
+    ident = host
+    try:
+        out = subprocess.run(["arp", "-a", host], capture_output=True, text=True, timeout=5).stdout
+        m = re.search(rf"{re.escape(host)}\s+([0-9a-fA-F]{{2}}[-:][0-9a-fA-F]{{2}}[-:][0-9a-fA-F:-]{{11}})", out)
+        if m:
+            ident = m.group(1).upper().replace("-", ":")
+    except Exception:
+        pass
+    return f"{user}@{ident}"
+
+
+def _saved_password(key: str) -> str | None:
+    try:
+        import keyring
+        return keyring.get_password(KEYRING_SERVICE, key)
+    except Exception:
+        return None
 
 
 def _open(host, user, port, password) -> paramiko.SSHClient:
@@ -340,21 +377,24 @@ def _top_filter_rule(args: str) -> str:
             f'else={{/ip firewall filter add {args}}}}}')
 
 
-def _apply(name, commands, description, rollback_minutes=5, hide=()) -> tuple[str, bool]:
+def _apply(name, commands, description, rollback_minutes=5, hide=(), fresh=True) -> tuple[str, bool]:
+    """fresh=False: a follow-up step of the same change; keeps the backup and the
+    rollback timer armed by the first step instead of re-taking them."""
     s = _session(name)
     folder = _site_folder("_changes", s["host"])
     (folder / "description.txt").write_text(description, encoding="utf-8")
     (folder / "commands.rsc").write_text("\n".join(commands), encoding="utf-8")
-    (folder / "before.rsc").write_text(_run(name, "/export show-sensitive terse", 90),
-                                       encoding="utf-8")
-    _run(name, f"/system backup save name={BACKUP_NAME} dont-encrypt=yes", 60)
-    time.sleep(2)
-    _run(name, f"/system scheduler remove [find name={ROLLBACK_SCHED}]")
-    if rollback_minutes > 0:
-        on_event = (f'/system scheduler remove [find name={ROLLBACK_SCHED}]; '
-                    f'/system backup load name={BACKUP_NAME} password=\\"\\"')
-        _run(name, f'/system scheduler add name={ROLLBACK_SCHED} '
-                   f'interval={rollback_minutes}m on-event="{on_event}"')
+    if fresh:
+        (folder / "before.rsc").write_text(_run(name, "/export show-sensitive terse", 90),
+                                           encoding="utf-8")
+        _run(name, f"/system backup save name={BACKUP_NAME} dont-encrypt=yes", 60)
+        time.sleep(2)
+        _run(name, f"/system scheduler remove [find name={ROLLBACK_SCHED}]")
+        if rollback_minutes > 0:
+            on_event = (f'/system scheduler remove [find name={ROLLBACK_SCHED}]; '
+                        f'/system backup load name={BACKUP_NAME} password=\\"\\"')
+            _run(name, f'/system scheduler add name={ROLLBACK_SCHED} '
+                       f'interval={rollback_minutes}m on-event="{on_event}"')
 
     log, ok = [], True
     for i, cmd in enumerate(commands, 1):
@@ -683,65 +723,105 @@ def discover_routers(seconds: int = 5) -> list[dict]:
             info.setdefault("ipv4", addr[0])
             found[info.get("mac", addr[0])] = info
     sock.close()
-    return list(found.values())
+    gw = _default_gateway()
+    for info in found.values():
+        info["is_default_gateway"] = info.get("ipv4") == gw
+    return sorted(found.values(), key=lambda i: not i["is_default_gateway"])
+
+
+def _default_gateway() -> str | None:
+    """IPv4 default gateway of this PC's current network configuration (lowest-metric
+    default route). The UDP connect() trick finds the active interface without sending."""
+    import subprocess
+    import sys
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
+                 "Where-Object { $_.NextHop -ne '0.0.0.0' } | "
+                 "Sort-Object { $_.RouteMetric + (Get-NetIPInterface -InterfaceIndex "
+                 "$_.InterfaceIndex -AddressFamily IPv4).InterfaceMetric } | "
+                 "Select-Object -First 1).NextHop"],
+                capture_output=True, text=True, timeout=15).stdout.strip()
+        elif sys.platform == "darwin":
+            out = subprocess.run("route -n get default | awk '/gateway:/{print $2}'",
+                                 shell=True, capture_output=True, text=True, timeout=10).stdout.strip()
+        else:
+            out = subprocess.run("ip -4 route show default | awk '{print $3; exit}'",
+                                 shell=True, capture_output=True, text=True, timeout=10).stdout.strip()
+        return str(ipaddress.IPv4Address(out.splitlines()[0].strip()))
+    except Exception:
+        return None
 
 
 @mcp.tool()
-def connect(host: str, username: str = "admin", name: str = "router",
-            port: int = 22, password: str | None = None) -> str:
-    """Open an SSH session to a router under `name`. Leave `password` empty so the
-    user is prompted in a local popup (keeps it out of the conversation)."""
+def connect(host: str | None = None, username: str = "admin", name: str = "router",
+            port: int = 22, password: str | None = None,
+            save_password: bool = False) -> str:
+    """Open an SSH session to the router under `name`. The router MUST be the default
+    gateway of this PC's current network configuration: leave `host` empty and it is
+    detected automatically; any other host is refused. Leave `password` empty so the
+    user is prompted in a local popup (keeps it out of the conversation). A password
+    saved earlier in the OS credential store is used automatically; set
+    save_password=True (after the user agrees) to store the one typed in the popup.
+    The default gateway is NOT always 192.168.88.1: never assume it, call
+    discover_routers (lists devices, flags the gateway) or just omit `host`."""
+    gw = _default_gateway()
+    if gw is None:
+        return "Could not determine this PC's default gateway. Check the network connection."
+    if host and host.strip() != gw:
+        return (f"Refused: {host} is not this PC's default gateway ({gw}). The router must be "
+                "the default gateway of the current network. Connect to the right network "
+                "or omit `host`.")
+    host = gw
+    key = _cred_key(host, username)
+    from_store = False
+    if password is None:
+        password = _saved_password(key)
+        from_store = password is not None
     if password is None:
         password = _popup_secret("MikroTik login", f"Password for {username}@{host}:")
-    client = _open(host, username, port, password)
+    try:
+        client = _open(host, username, port, password)
+    except paramiko.AuthenticationException:
+        if not from_store:
+            raise
+        forget_password(host, username)  # stale saved password: ask again
+        password = _popup_secret("MikroTik login", f"Saved password rejected. Password for {username}@{host}:")
+        client = _open(host, username, port, password)
+        from_store = False
+    saved = ""
+    if save_password and not from_store:
+        try:
+            import keyring
+            keyring.set_password(KEYRING_SERVICE, key, password)
+            saved = "\nPassword saved in the OS credential store for this router."
+        except Exception as e:
+            saved = f"\nCould not save the password in the OS credential store: {e}"
+    elif from_store:
+        saved = "\nUsed the password saved in the OS credential store."
     if name in SESSIONS:
         SESSIONS[name]["client"].close()
     SESSIONS[name] = {"client": client, "host": host, "user": username,
                       "port": port, "password": password}
-    return (f"Connected to {host} as '{name}'.\n" + _run(name, "/system identity print")
+    return (f"Connected to {host} as '{name}'.{saved}\n" + _run(name, "/system identity print")
             + "\n\n" + _local_link(name)["text"])
 
 
-RENEW_STEPS = ("Windows: ipconfig /release then ipconfig /renew | "
-               "macOS: sudo ipconfig set <en0> DHCP | "
-               "Linux: sudo dhclient -r <iface> && sudo dhclient <iface> "
-               "(or unplug/replug the cable)")
-
-
-def _local_link(name: str) -> dict:
-    """Where the technician's PC sits relative to the router: its IP, whether it is
-    inside one of the router's subnets, and whether it got that IP from the router's DHCP."""
-    info = {"local_ip": None, "interface": None, "network": None, "dhcp": False}
+@mcp.tool()
+def forget_password(host: str | None = None, username: str = "admin") -> str:
+    """Delete the router password saved in the OS credential store. `host` defaults
+    to the current default gateway."""
+    host = host or _default_gateway()
+    if not host:
+        return "Could not determine the router address."
     try:
-        ip = ipaddress.ip_address(_session(name)["client"].get_transport().sock.getsockname()[0])
+        import keyring
+        keyring.delete_password(KEYRING_SERVICE, _cred_key(host, username))
+        return f"Saved password for {username}@{host} deleted."
     except Exception:
-        info["text"] = "Technician PC: could not determine its IP address."
-        return info
-    info["local_ip"] = str(ip)
-    for a, iface in _router_networks(name):
-        if a.version == ip.version and ip in a.network:
-            info["interface"], info["network"] = iface, str(a.network)
-            break
-    if info["network"]:
-        info["dhcp"] = any(l.get("address") == str(ip)
-                           for l in _terse(name, "/ip dhcp-server lease print terse"))
-        how = "an IP leased by this router's DHCP" if info["dhcp"] else \
-            "a STATIC IP (no DHCP lease found on this router)"
-        text = (f"Technician PC: {ip} is ON the router's network {info['network']} "
-                f"(interface {info['interface']}) with {how}.\n"
-                "IMPORTANT: if the customer asks to change this network's IP/subnet, this PC "
-                "loses the connection when the change is applied. ")
-        text += (f"After applying, release/renew the PC's IP ({RENEW_STEPS}), then "
-                 "reconnect(new_host=<new router IP>) and confirm_changes before the rollback timer ends."
-                 if info["dhcp"] else
-                 "After applying, set a static IP on the PC inside the new subnet, then "
-                 "reconnect(new_host=<new router IP>) and confirm_changes before the rollback timer ends.")
-    else:
-        text = (f"Technician PC: {ip} is NOT in any of the router's subnets (reached through "
-                "routing). Changing the LAN IP should not cut this PC off, but verify the route.")
-    info["text"] = text
-    _session(name)["local_link"] = info
-    return info
+        return f"No saved password for {username}@{host}."
 
 
 @mcp.tool()
@@ -1835,6 +1915,415 @@ def wireguard_remove_peer(interface: str, peer: str, name: str = "router",
     _require_v7(name)
     C = [f"/interface wireguard peers remove {_peer_find(interface, peer)}"]
     return _plan(name, C, f"Eliminar peer WireGuard '{peer[:20]}' de {interface}", dry_run, rollback_minutes)
+
+
+# =====================================================================
+# Site-to-site tunnels: WireGuard + iBGP / OSPF / static (hub and spokes).
+# Design: docs/runbook-tunnels.md. One WireGuard interface per spoke on the hub.
+# =====================================================================
+
+def _bgp_filter(chain: str, nets: list) -> list[str]:
+    C = [f'/routing filter rule remove [find chain={q(chain)}]']
+    for n in nets:
+        C.append(f'/routing filter rule add chain={q(chain)} '
+                 f'rule="if (dst in {n} && dst-len == {n.prefixlen}) {{ accept }}"')
+    C.append(f'/routing filter rule add chain={q(chain)} rule="reject"')
+    return C
+
+
+def _tunnel_tag(wg: str) -> str:
+    return f"mcp-tunnel: {wg}"
+
+
+def _tunnel_side(s: dict) -> list[str]:
+    """Commands for ONE router of a link (interface, lists, firewall, routing).
+    The WireGuard peer is separate (_tunnel_peer) because it needs the other side's key."""
+    wg, role, tag = s["wg"], s["role"], _tunnel_tag(s["wg"])
+    lst = "SPOKES" if role == "hub" else "HUB"
+    ip, peer_ip = s["cidr"].split("/")[0], s["peer_ip"]
+    C = [f':if ([:len [/interface wireguard find name={q(wg)}]] = 0) '
+         f'do={{/interface wireguard add name={q(wg)} listen-port={s["port"]}}} '
+         f'else={{/interface wireguard set [find name={q(wg)}] listen-port={s["port"]}}}',
+         f'/ip address remove [find interface={q(wg)} address!={q(s["cidr"])}]',
+         f':if ([:len [/ip address find interface={q(wg)} address={q(s["cidr"])}]] = 0) '
+         f'do={{/ip address add address={q(s["cidr"])} interface={q(wg)}}}',
+         _ensure_list(lst), _ensure_member(lst, wg)]
+
+    rules = []  # (suffix, rule args)
+    if role == "hub":
+        rules.append(("udp", f'chain=input action=accept protocol=udp dst-port={s["port"]}'))
+        if s["isolate"]:
+            rules.append(("isolate", 'chain=forward action=drop in-interface-list=SPOKES '
+                                     'out-interface-list=SPOKES'))
+        if s["block_initiated"]:
+            rules.append(("no-initiate", 'chain=forward action=drop connection-state=new '
+                                         'in-interface-list=SPOKES'))
+    rules.append(("icmp", f'chain=input action=accept protocol=icmp in-interface-list={lst}'))
+    if s["routing"] == "ibgp":
+        rules.append(("bgp", f'chain=input action=accept protocol=tcp dst-port=179 in-interface-list={lst}'))
+    elif s["routing"] == "ospf":
+        rules.append(("ospf", f'chain=input action=accept protocol=ospf in-interface-list={lst}'))
+    if s["mgmt"]:
+        al = f"mcp-mgmt-{wg}"
+        C.append(f'/ip firewall address-list remove [find list={q(al)}]')
+        for n in [ipaddress.ip_network(peer_ip + "/32")] + s["peer_lans"]:
+            C.append(f'/ip firewall address-list add list={q(al)} address={n}')
+        rules.append(("mgmt", f'chain=input action=accept protocol=tcp dst-port=22,8291 '
+                              f'in-interface-list={lst} src-address-list={al}'))
+    for suffix, args in rules:
+        comment = f"{tag} {suffix}"
+        C.append(f'/ip firewall filter remove [find comment={q(comment)}]')
+        C.append(_top_filter_rule(f'{args} comment={q(comment)}'))
+
+    if s["routing"] == "ibgp":
+        in_c, out_c, conn = f"mcp-bgp-in-{wg}", f"mcp-bgp-out-{wg}", f"bgp-{wg}"
+        C += _bgp_filter(out_c, s["lans"]) + _bgp_filter(in_c, s["peer_lans"])
+        if s["ver"] >= (7, 20):
+            C.append(f':if ([:len [/routing bgp instance find name=bgp-main]] = 0) do={{'
+                     f'/routing bgp instance add name=bgp-main as={s["asn"]} router-id={ip}}}')
+            base = " instance=bgp-main"
+        else:
+            base = f" as={s['asn']} router-id={ip}"
+        C.append(f'/routing bgp connection remove [find name={q(conn)}]')
+        C.append(f'/routing bgp connection add name={q(conn)}{base} local.role=ibgp '
+                 f'local.address={ip} remote.address={peer_ip} remote.as={s["asn"]} '
+                 f'input.filter={q(in_c)} output.filter-chain={q(out_c)} output.redistribute=connected')
+    elif s["routing"] == "ospf":
+        c = f"{tag} ospf"
+        C += [f':if ([:len [/routing ospf instance find name=mcp-ospf]] = 0) '
+              f'do={{/routing ospf instance add name=mcp-ospf version=2 router-id={ip}}}',
+              f':if ([:len [/routing ospf area find name=mcp-backbone]] = 0) '
+              f'do={{/routing ospf area add name=mcp-backbone area-id=0.0.0.0 instance=mcp-ospf}}',
+              f'/routing ospf interface-template remove [find comment={q(c)}]',
+              f'/routing ospf interface-template add area=mcp-backbone interfaces={q(wg)} '
+              f'type=ptp comment={q(c)}']
+        C += [f'/routing ospf interface-template add area=mcp-backbone networks={n} passive '
+              f'comment={q(c)}' for n in s["lans"]]
+    else:  # static
+        c = f"{tag} route"
+        C.append(f'/ip route remove [find comment={q(c)}]')
+        C += [f'/ip route add dst-address={n} gateway={peer_ip} comment={q(c)}' for n in s["peer_lans"]]
+    return C
+
+
+def _tunnel_peer(s: dict, pub: str) -> list[str]:
+    """The peer allows ONLY the other side's tunnel IP and LANs (never 0.0.0.0/0)."""
+    wg, tag = s["wg"], _tunnel_tag(s["wg"])
+    allowed = ",".join([f'{s["peer_ip"]}/32'] + [str(n) for n in s["peer_lans"]])
+    c = (f'/interface wireguard peers add interface={q(wg)} public-key={q(pub)} '
+         f'allowed-address={q(allowed)} comment={q(tag)}')
+    if s["endpoint"]:
+        c += f' endpoint-address={q(s["endpoint"][0])} endpoint-port={s["endpoint"][1]}'
+    if s["keepalive"]:
+        c += f' persistent-keepalive={s["keepalive"]}s'
+    return [f'/interface wireguard peers remove [find interface={q(wg)} comment={q(tag)}]', c]
+
+
+@ui_tool
+def tunnel_setup(
+        name: str, role: str, wg_name: str, local_tunnel_ip: str, remote_tunnel_ip: str,
+        listen_port: int, local_lans: str, remote_lans: str, routing: str,
+        hub_endpoint: str | None = None, remote_name: str | None = None,
+        remote_public_key: str | None = None, remote_wg_name: str | None = None,
+        as_number: int = 65000, remote_routeros_version: str | None = None,
+        allow_management: bool = True, isolate_spokes: bool = True,
+        block_spoke_initiated: bool = False, site: str | None = None,
+        dry_run: bool = True, rollback_minutes: int = 10) -> str:
+    """Configure ONE site-to-site link (WireGuard + dynamic routing) between the connected
+    router `name` and a second router. For 2 sites one acts as hub; for more sites call it
+    once per spoke on the hub (one wg interface + UDP port + /30 per spoke).
+    Design and the isolation layers: docs/runbook-tunnels.md. ALL values come from the user.
+
+    role: role of THIS router: 'hub' (public IP, listens) or 'spoke' (initiates, keepalive 25).
+    wg_name: WireGuard interface on this router (e.g. wg-of01 on the hub, wg-hub on a spoke).
+    local_tunnel_ip: this router's tunnel IP with mask ('10.255.0.5/30'); remote_tunnel_ip:
+      the other side's IP (no mask), in the same subnet.
+    listen_port: UDP port (the hub's, unique per spoke). hub_endpoint: the hub's public
+      'host:port' (required if role='spoke'; also needed to build the spoke's script).
+    local_lans / remote_lans: comma-separated LAN subnets of each side. Only these are
+      advertised/allowed. They must not overlap each other or the tunnel net.
+    routing: 'ibgp' (recommended: filters isolate spokes, AS=as_number, no route-reflector),
+      'ospf' (no route filtering: spokes isolation then relies on firewall + allowed-address)
+      or 'static'.
+    remote_name: session name of the other router if it is reachable (both are configured
+      and keys exchanged automatically). If it is NOT reachable, leave empty: a CLI script
+      for the other router is generated and saved; run it there, read its public key and call
+      this tool again with remote_public_key to add the peer here.
+    remote_public_key: the other router's PUBLIC key (never private keys). remote_wg_name /
+      remote_routeros_version: only for the generated script (default same name / >= 7.20).
+    allow_management: accept SSH/Winbox from the other side's tunnel IP and LANs only
+      (needed by tunnel_verify to log in to every router through the tunnel).
+    isolate_spokes (hub): drop forward between spokes. block_spoke_initiated (hub): spokes
+      cannot start connections towards the hub side. Ask the user about the latter.
+    Verify afterwards with tunnel_verify, then confirm_changes on EVERY session touched."""
+    _require_v7(name)
+    if role not in ("hub", "spoke"):
+        return "role must be 'hub' or 'spoke'. Ask the user which role this router has."
+    if routing not in ("ibgp", "ospf", "static"):
+        return "routing must be 'ibgp', 'ospf' or 'static'. Ask the user."
+    errors, warnings = [], []
+    res, err = _check(local_tunnel_ip, "interface", "local_tunnel_ip")
+    if err or len(res) != 1:
+        return err or "Give exactly one local_tunnel_ip."
+    lt = res[0]
+    tnet = ipaddress.ip_network(lt["network"])
+    try:
+        rip = ipaddress.ip_address(remote_tunnel_ip.strip().split("/")[0])
+    except ValueError:
+        return f"remote_tunnel_ip '{remote_tunnel_ip}' is not a valid IP."
+    if rip not in tnet or str(rip) == lt["ip"]:
+        errors.append(f"remote_tunnel_ip {rip} must be a different address inside {tnet}.")
+    lr, e1 = _check(local_lans, "network", "local_lans")
+    rr, e2 = _check(remote_lans, "network", "remote_lans")
+    if e1 or e2:
+        return e1 or e2
+    lans = [ipaddress.ip_network(r["cidr"]) for r in lr]
+    rlans = [ipaddress.ip_network(r["cidr"]) for r in rr]
+    for a in lans:
+        for b in rlans + [tnet]:
+            if a.overlaps(b):
+                errors.append(f"{a} overlaps {b}. Never connect overlapping networks: renumber one.")
+    if not 1 <= listen_port <= 65535:
+        errors.append("listen_port must be 1-65535.")
+    ov = _overlaps(name, tnet, exclude_interface=wg_name)
+    if ov:
+        errors.append(f"Tunnel network {tnet} overlaps existing subnet(s): {', '.join(ov)}.")
+    for n, w in _wg_interfaces(name).items():
+        if n != wg_name and w.get("listen-port") == str(listen_port):
+            errors.append(f"UDP {listen_port} is already used by WireGuard interface {n}.")
+    connected = [a.network for a, _ in _router_networks(name)]
+    for n in lans:
+        if n not in connected:
+            warnings.append(f"{n} is not a directly connected network of this router: "
+                            "it won't be advertised (output.redistribute=connected).")
+    ep = None
+    if hub_endpoint:
+        try:
+            ep = _parse_endpoint(hub_endpoint, default_port=listen_port)
+        except ValueError as e:
+            errors.append(str(e))
+    elif role == "spoke":
+        errors.append("hub_endpoint (the hub's public IP/hostname) is required for a spoke. Ask the user.")
+    if remote_public_key and _key_error(remote_public_key, "remote_public_key"):
+        errors.append(_key_error(remote_public_key, "remote_public_key") or "")
+    if remote_name:
+        try:
+            _require_v7(remote_name)
+        except RuntimeError as e:
+            errors.append(f"{remote_name}: {e}")
+    if errors:
+        return "Cannot continue:\n- " + "\n- ".join(errors) + "\nAsk the user to correct these values."
+
+    ver_l = _version(name)
+    if remote_name:
+        ver_r = _version(remote_name)
+    elif remote_routeros_version and re.fullmatch(r"\d+(\.\d+)+", remote_routeros_version):
+        ver_r = tuple(int(x) for x in remote_routeros_version.split("."))
+    else:
+        ver_r = (7, 20)
+        if routing == "ibgp":
+            warnings.append("Remote RouterOS version unknown: script uses the 7.20+ BGP syntax "
+                            "('/routing bgp instance'). Pass remote_routeros_version if older.")
+    other = "spoke" if role == "hub" else "hub"
+    common = dict(routing=routing, asn=as_number, isolate=isolate_spokes,
+                  block_initiated=block_spoke_initiated, mgmt=allow_management)
+    local = dict(common, role=role, wg=wg_name, cidr=lt["cidr"], peer_ip=str(rip), port=listen_port,
+                 lans=lans, peer_lans=rlans, endpoint=ep if role == "spoke" else None,
+                 keepalive=25 if role == "spoke" else None, ver=ver_l)
+    remote = dict(common, role=other, wg=remote_wg_name or wg_name,
+                  cidr=f"{rip}/{tnet.prefixlen}", peer_ip=lt["ip"], port=listen_port,
+                  lans=rlans, peer_lans=lans,
+                  endpoint=ep if other == "spoke" else None,
+                  keepalive=25 if other == "spoke" else None, ver=ver_r)
+    if other == "spoke" and not ep:
+        remote["endpoint"] = ("<HUB_PUBLIC_IP>", listen_port)
+        warnings.append("hub_endpoint missing: the spoke script has a <HUB_PUBLIC_IP> placeholder. Ask the user.")
+    if allow_management:
+        for r in [name] + ([remote_name] if remote_name else []):
+            svc = [x for x in _terse(r, "/ip service print terse")
+                   if x.get("name") in ("ssh", "winbox") and x.get("address")]
+            if svc:
+                warnings.append(f"{r}: SSH/Winbox have available-from restrictions "
+                                f"({', '.join(x['name'] + '=' + x['address'] for x in svc)}). Add the "
+                                "other side's LANs there too (keep the local LAN) or logins through the tunnel fail.")
+
+    l_cmds, r_cmds = _tunnel_side(local), _tunnel_side(remote)
+    desc = f"Tunel {routing} {wg_name}: {lt['cidr']} <-> {rip} ({role})"
+    notes = ("Layers: " + ("iBGP filters (own LANs out, peer LANs in), " if routing == "ibgp" else "")
+             + ("hub drops spoke<->spoke forward, " if role == "hub" and isolate_spokes else "")
+             + "peer allowed-address = peer tunnel IP + peer LANs only.\n"
+             + (f"Remote router '{remote_name}' is connected: both sides will be configured and keys exchanged.\n"
+                if remote_name else
+                "Remote router is NOT connected: a CLI script for it will be generated.\n")
+             + ("Warnings:\n- " + "\n- ".join(warnings) if warnings else ""))
+
+    if dry_run:
+        def peer_preview(side, pub):
+            return _tunnel_peer(side, pub)[1]
+        rp = peer_preview(local, remote_public_key or "<remote public key>")
+        lp = peer_preview(remote, "<this router's public key>")
+        all_cmds = [f"# {name}"] + l_cmds + [rp] + \
+                   ([f"# {remote_name}"] if remote_name else ["# SCRIPT for the remote router"]) + r_cmds + [lp]
+        _ui_set({"view": "plan", "description": desc, "notes": notes, "commands": all_cmds,
+                 "rollback_minutes": rollback_minutes})
+        return (f"DRY RUN: nothing was changed.\n\nPlan: {desc}\n\nNotes:\n{notes}\n\n"
+                f"THIS router ({name}):\n" + "\n".join(f"  {c}" for c in l_cmds + [rp])
+                + f"\n\n{'REMOTE router ' + remote_name if remote_name else 'REMOTE router (script, not reachable)'}:\n"
+                + "\n".join(f"  {c}" for c in r_cmds + [lp])
+                + "\n\nExplain to the user. After approval call again with dry_run=False.")
+
+    out = []
+    text, ok = _apply(name, l_cmds, desc, rollback_minutes)
+    out.append(f"== {name} ==\n{text}")
+    if not ok:
+        return "\n".join(out)
+    local_pub = _wg_interfaces(name).get(wg_name, {}).get("public-key", "")
+    remote_pub = remote_public_key
+    sessions = [name]
+    if remote_name:
+        text, ok = _apply(remote_name, r_cmds, desc, rollback_minutes)
+        out.append(f"== {remote_name} ==\n{text}")
+        if not ok:
+            return "\n".join(out) + f"\n{name} was already changed: rollback_now on it if you stop here."
+        remote_pub = _wg_interfaces(remote_name).get(remote["wg"], {}).get("public-key", "")
+        sessions.append(remote_name)
+        text, ok = _apply(remote_name, _tunnel_peer(remote, local_pub)[0:2], desc + " (peer)",
+                          rollback_minutes, fresh=False)
+        out.append(f"== {remote_name} peer ==\n{text}")
+    if remote_pub:
+        text, ok2 = _apply(name, _tunnel_peer(local, remote_pub), desc + " (peer)",
+                           rollback_minutes, fresh=False)
+        out.append(f"== {name} peer ==\n{text}")
+    else:
+        out.append(f"Peer on {name} NOT added yet: the remote public key is unknown.")
+    if not remote_name:
+        script = "\n".join(r_cmds + _tunnel_peer(remote, local_pub))
+        folder = _site_folder(site or _session(name)["host"], "tunnels")
+        safe = re.sub(r"[^\w.-]", "_", remote["wg"])
+        f = folder / f"remote-{safe}.rsc"
+        f.write_text(script, encoding="utf-8")
+        out.append(f"\nCLI SCRIPT for the remote router ({f}). Paste it in its terminal "
+                   f"(or /import), then read its key with `/interface wireguard print "
+                   f"where name={remote['wg']}` and call tunnel_setup again with "
+                   f"remote_public_key=<that key>:\n\n{script}")
+    out.append(f"\nPublic key of {name}/{wg_name}: {local_pub}\n"
+               f"Next: tunnel_verify, then confirm_changes on: {', '.join(sessions)}.")
+    return "\n".join(out)
+
+
+def _ping(name: str, dst: str, src: str | None = None, count: int = 4) -> int:
+    out = _run(name, f"/ping {dst} count={count}" + (f" src-address={src}" if src else ""), 40)
+    m = re.findall(r"received=(\d+)", out)
+    return int(m[-1]) if m else 0
+
+
+def _handshake_age(text: str) -> int | None:
+    m = re.fullmatch(r"(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", (text or "").strip())
+    if not m or not any(m.groups()):
+        return None
+    w, d, h, mi, sec = (int(x or 0) for x in m.groups())
+    return ((w * 7 + d) * 24 + h) * 3600 + mi * 60 + sec
+
+
+def _link_checks(name: str, wg: str, peer_ip: str, my_ip: str, routing: str,
+                 peer_lans: list[str]) -> list[tuple[str, bool, str]]:
+    """Checks run on one router of the link, against the other one."""
+    R = []
+    peers = [p for p in _terse(name, "/interface wireguard peers print terse") if p.get("interface") == wg]
+    age = _handshake_age(peers[0].get("last-handshake", "")) if peers else None
+    R.append((f"[{name}] WireGuard handshake on {wg}", age is not None and age <= 180,
+              "no peer" if not peers else (f"{age}s ago" if age is not None else "never")))
+    got = _ping(name, peer_ip, src=my_ip)
+    R.append((f"[{name}] ping {peer_ip} through the tunnel", got > 0, f"{got}/4 replies"))
+    if routing == "ibgp":
+        rows = _terse(name, "/routing bgp session print terse")
+        ok = any(r.get("remote.address") == peer_ip and
+                 (r.get("established") in ("true", "yes") or "E" in r["_flags"]) for r in rows)
+        R.append((f"[{name}] BGP session with {peer_ip} established", ok, "ok" if ok else "not established"))
+    elif routing == "ospf":
+        rows = _terse(name, "/routing ospf neighbor print terse")
+        ok = any(r.get("address") == peer_ip and r.get("state") == "Full" for r in rows)
+        R.append((f"[{name}] OSPF neighbor {peer_ip} Full", ok, "ok" if ok else "not Full"))
+    for lan in peer_lans:
+        rows = _terse(name, f"/ip route print terse where dst-address={lan}")
+        ok = any(not r["_disabled"] and "A" in r["_flags"] for r in rows)
+        R.append((f"[{name}] active route to {lan}", ok, "ok" if ok else "missing"))
+    return R
+
+
+@ui_tool
+def tunnel_verify(name: str, wg_name: str, remote_tunnel_ip: str, routing: str,
+                  local_lans: str, remote_lans: str, remote_name: str | None = None,
+                  remote_user: str = "admin", remote_password: str | None = None,
+                  isolation_test_ip: str | None = None, isolation_from: str = "remote") -> str:
+    """Verify a tunnel BEFORE confirm_changes. Checks on this router and on the remote one:
+    WireGuard handshake, ping both ways across the tunnel (=> both firewalls accept the
+    traffic), BGP established / OSPF Full, active routes to the other side's LANs, and a
+    real SSH LOGIN to the remote router through its tunnel IP from this PC.
+    If remote_name (a session) is empty, the login through the tunnel is also used to run
+    the remote-side checks. Leave remote_password empty (saved or local popup).
+    isolation_test_ip: an IP of ANOTHER spoke's LAN; pinged from the spoke
+    (isolation_from='remote' or 'local'): it must NOT answer.
+    Returns PASS/FAIL per check and whether it is safe to confirm_changes."""
+    my = _wg_addrs(name, wg_name)
+    if not my:
+        return f"{wg_name} has no IP on {name}."
+    my_ip = str(my[0].ip)
+    lres, _ = _check(local_lans, "network", "local_lans")
+    rres, _ = _check(remote_lans, "network", "remote_lans")
+    llans, rlans = [r["cidr"] for r in lres], [r["cidr"] for r in rres]
+    R = _link_checks(name, wg_name, remote_tunnel_ip, my_ip, routing, rlans)
+
+    tmp, client = None, None
+    key = f"{remote_user}@{remote_tunnel_ip}"
+    try:
+        socket.create_connection((remote_tunnel_ip, 22), timeout=6).close()
+        reach = True
+    except OSError as e:
+        reach = False
+        R.append((f"SSH port 22 of {remote_tunnel_ip} reachable from this PC", False,
+                  f"{e}. Check the route from this PC, allow_management and the remote firewall input"))
+    if reach:
+        pw = remote_password or _saved_password(key) or \
+            _popup_secret("MikroTik login", f"Password for {remote_user}@{remote_tunnel_ip} (via tunnel):")
+        try:
+            client = _open(remote_tunnel_ip, remote_user, 22, pw)
+            R.append((f"Login to {remote_tunnel_ip} through the tunnel", True, "ok"))
+        except Exception as e:
+            R.append((f"Login to {remote_tunnel_ip} through the tunnel", False, str(e)))
+    rname = remote_name
+    if not rname and client:
+        tmp = rname = f"_verify-{wg_name}"
+        SESSIONS[tmp] = {"client": client, "host": remote_tunnel_ip, "user": remote_user,
+                         "port": 22, "password": pw}
+    try:
+        if rname:
+            rwg = next((i for a, i in _router_networks(rname) if str(a.ip) == remote_tunnel_ip), None)
+            if rwg is None:
+                R.append((f"[{rname}] interface holding {remote_tunnel_ip}", False, "not found"))
+            else:
+                R += _link_checks(rname, rwg, my_ip, remote_tunnel_ip, routing, llans)
+        else:
+            R.append(("Checks on the remote router", False, "no session and no login: cannot check its side"))
+        if isolation_test_ip:
+            who = rname if isolation_from == "remote" else name
+            if who:
+                got = _ping(who, isolation_test_ip)
+                R.append((f"[{who}] ISOLATION: {isolation_test_ip} must NOT answer", got == 0,
+                          "isolated" if got == 0 else f"{got}/4 replies: SECURITY INCIDENT, do not confirm"))
+    finally:
+        if tmp:
+            SESSIONS.pop(tmp, None)
+        if client:
+            client.close()
+    lines = [f"{'PASS' if ok else 'FAIL'}  {label}: {detail}" for label, ok, detail in R]
+    bad = [label for label, ok, _ in R if not ok]
+    _ui_set({"view": "message"})
+    verdict = ("ALL CHECKS PASSED. Ask the user to confirm their access, then confirm_changes on every "
+               "session of this tunnel." if not bad else
+               "NOT SAFE TO CONFIRM. Failed: " + "; ".join(bad) + ". Do not confirm; fix or rollback_now. "
+               "See docs/runbook-tunnels.md (section 'Problemas comunes').")
+    return "\n".join(lines) + "\n\n" + verdict
 
 
 # =====================================================================
